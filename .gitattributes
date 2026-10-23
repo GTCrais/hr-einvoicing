@@ -1,0 +1,9 @@
+* text=auto
+
+# The schemas are kept byte for byte as published
+*.xsd -text
+
+/tests export-ignore
+/.gitattributes export-ignore
+/.gitignore export-ignore
+/phpunit.xml.dist export-ignore
