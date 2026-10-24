@@ -4,9 +4,12 @@ namespace GTCrais\HrEInvoicing\MojEracun;
 
 use Carbon\CarbonImmutable;
 use DateTimeInterface;
+use GTCrais\HrEInvoicing\Concerns\ChoosesEnvironment;
 use GTCrais\HrEInvoicing\Contracts\EInvoiceGateway;
+use GTCrais\HrEInvoicing\DocumentStatus;
 use GTCrais\HrEInvoicing\Exceptions\EInvoiceRefusedException;
 use GTCrais\HrEInvoicing\Exceptions\EInvoiceUnavailableException;
+use GTCrais\HrEInvoicing\FiscalizationStatus;
 use GTCrais\HrEInvoicing\MojEracun\Contracts\AccountProvider;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\Response;
@@ -19,11 +22,15 @@ use RuntimeException;
  * one and the software identifier), the document goes as the XML text of a JSON request, and the answers come back
  * as JSON whose keys are written now with a capital and now without, so they are read either way. A query answers
  * with a list; the tax authority's answers about an e-invoice come as a list of documents, each with its messages,
- * and as a 404 while there are none yet. The environment is "demo" or "production", and a call may take
- * attemptSeconds; the service provider builds it from config('hrEInvoicing').
+ * and as a 404 while there are none yet. Moj-eRačun's status codes (20 taken in, 30 sent, 40 delivered, 50 refused,
+ * 70 reported to the tax authority because the buyer takes no e-invoices) become the package's DocumentStatus. The
+ * environment is "demo" or "production", the account's own when it names one, and a call may take attemptSeconds;
+ * the service provider builds it from config('hrEInvoicing').
  */
 class MojEracunClient implements EInvoiceGateway
 {
+	use ChoosesEnvironment;
+
 	/** The intermediary's services by environment */
 	public const array SERVICES = [
 		'demo' => 'https://demo.moj-eracun.hr',
@@ -53,7 +60,7 @@ class MojEracunClient implements EInvoiceGateway
 			throw new RuntimeException('The intermediary answered without a document identifier.');
 		}
 
-		return ['electronicId' => (string) $electronicId, 'status' => (int) ($this->value($document, 'StatusId') ?? 20)];
+		return ['electronicId' => (string) $electronicId, 'status' => $this->documentStatus($this->value($document, 'StatusId'))];
 	}
 
 	/**
@@ -71,7 +78,7 @@ class MojEracunClient implements EInvoiceGateway
 			->sortByDesc(fn (array $row) => (int) $this->value($row, 'ElectronicId'))
 			->first();
 
-		return $document === null ? null : ['electronicId' => (string) $this->value($document, 'ElectronicId'), 'status' => (int) ($this->value($document, 'StatusId') ?? 20)];
+		return $document === null ? null : ['electronicId' => (string) $this->value($document, 'ElectronicId'), 'status' => $this->documentStatus($this->value($document, 'StatusId'))];
 	}
 
 	public function status(string $electronicId): array
@@ -84,9 +91,14 @@ class MojEracunClient implements EInvoiceGateway
 			throw new RuntimeException('The intermediary does not know the document ' . $electronicId . '.');
 		}
 
+		$status = $this->documentStatus($this->value($document, 'StatusId'));
 		[$fiscalization, $error] = $this->fiscalization($electronicId);
 
-		return ['status' => (int) ($this->value($document, 'StatusId') ?? 20), 'fiscalization' => $fiscalization, 'error' => $error];
+		if ($status === DocumentStatus::REFUSED && $error === null) {
+			$error = trim((string) ($this->value($document, 'StatusName') ?? '')) ?: null;
+		}
+
+		return ['status' => $status, 'fiscalization' => $fiscalization, 'error' => $error];
 	}
 
 	public function reportPayment(string $electronicId, string $paidOn, float $amount): void
@@ -101,11 +113,11 @@ class MojEracunClient implements EInvoiceGateway
 
 	public function ping(): void
 	{
-		$this->accounts->account() ?? throw new RuntimeException('The intermediary account is not set up.');
+		$account = $this->accounts->account() ?? throw new RuntimeException('The intermediary account is not set up.');
 
 		// The service answers its ping without the account; while it does not, the account cannot be checked
 		try {
-			$response = Http::acceptJson()->timeout($this->seconds())->get($this->url('/apis/v2/Ping/'));
+			$response = Http::acceptJson()->timeout($this->seconds())->get($this->url('/apis/v2/Ping/', $account));
 		} catch (ConnectionException $exception) {
 			throw new EInvoiceUnavailableException($exception->getMessage());
 		}
@@ -119,10 +131,23 @@ class MojEracunClient implements EInvoiceGateway
 	}
 
 	/**
-	 * The tax authority's latest answer about the e-invoice, or nothing while it has given none: success,
-	 * failure with its code and reason, or waiting.
+	 * Moj-eRačun's status code of a document as the package's standing.
+	 */
+	protected function documentStatus(mixed $statusId): DocumentStatus
+	{
+		return match ((int) ($statusId ?? 20)) {
+			50 => DocumentStatus::REFUSED,
+			70 => DocumentStatus::REPORTED,
+			40 => DocumentStatus::DELIVERED,
+			default => DocumentStatus::SENT,
+		};
+	}
+
+	/**
+	 * The tax authority's latest answer about the e-invoice, or nothing while it has given none: taken, refused with
+	 * its code and reason, or waiting.
 	 *
-	 * @return array{0: ?int, 1: ?string}
+	 * @return array{0: ?FiscalizationStatus, 1: ?string}
 	 */
 	protected function fiscalization(string $electronicId): array
 	{
@@ -144,9 +169,11 @@ class MojEracunClient implements EInvoiceGateway
 			return [null, null];
 		}
 
-		$status = (int) $this->value($latest, 'status');
-
-		return [$status, $status === 1 ? $this->messageError($latest) : null];
+		return match ((int) $this->value($latest, 'status')) {
+			0 => [FiscalizationStatus::FISCALIZED, null],
+			1 => [FiscalizationStatus::FAILED, $this->messageError($latest)],
+			default => [FiscalizationStatus::WAITING, null],
+		};
 	}
 
 	/**
@@ -172,12 +199,16 @@ class MojEracunClient implements EInvoiceGateway
 	protected function post(string $path, array $payload, bool $quietlyMissing = false): array
 	{
 		$account = $this->accounts->account() ?? throw new RuntimeException('The intermediary account is not set up.');
+		$url = $this->url($path, $account);
+
+		// The service's environment is the account's affair, not the service's
+		unset($account['environment']);
 
 		try {
 			$response = Http::acceptJson()
 				->timeout($this->seconds())
 				->connectTimeout(5)
-				->post($this->url($path), [...$account, ...$payload]);
+				->post($url, [...$account, ...$payload]);
 		} catch (ConnectionException $exception) {
 			throw new RuntimeException($exception->getMessage());
 		}
@@ -253,9 +284,12 @@ class MojEracunClient implements EInvoiceGateway
 		return 'HTTP ' . $response->status() . ($response->body() !== '' ? ': ' . mb_substr(trim($response->body()), 0, 300) : '');
 	}
 
-	protected function url(string $path): string
+	/**
+	 * @param  array<string, mixed>  $account
+	 */
+	protected function url(string $path, array $account): string
 	{
-		return rtrim(self::SERVICES[$this->environment === 'production' ? 'production' : 'demo'], '/') . $path;
+		return $this->serviceFor(self::SERVICES, $account) . $path;
 	}
 
 	protected function seconds(): int

@@ -1,7 +1,10 @@
 <?php
 
+use GTCrais\HrEInvoicing\DocumentStatus;
 use GTCrais\HrEInvoicing\Exceptions\EInvoiceRefusedException;
 use GTCrais\HrEInvoicing\Exceptions\EInvoiceUnavailableException;
+use GTCrais\HrEInvoicing\FiscalizationStatus;
+use GTCrais\HrEInvoicing\MojEracun\Contracts\AccountProvider;
 use GTCrais\HrEInvoicing\MojEracun\MojEracunClient;
 use Illuminate\Http\Client\Request;
 use Illuminate\Support\Carbon;
@@ -20,14 +23,14 @@ beforeEach(function () {
 	Http::preventStrayRequests();
 });
 
-it('sends the document with the account in the shape the demo service takes, and keeps its identifier and status', function () {
+it('sends the document with the account in the shape the demo service takes, and keeps its identifier and standing', function () {
 	Http::fake([
 		'https://demo.moj-eracun.hr/apis/v2/send' => Http::response(['ElectronicId' => 3687370, 'DocumentNr' => '455/P1/1', 'DocumentTypeId' => 1, 'StatusId' => 20, 'StatusName' => 'Obrađen']),
 	]);
 
 	$answer = app(MojEracunClient::class)->send('<Invoice/>');
 
-	expect($answer)->toBe(['electronicId' => '3687370', 'status' => 20]);
+	expect($answer)->toBe(['electronicId' => '3687370', 'status' => DocumentStatus::SENT]);
 
 	Http::assertSent(fn (Request $request) => $request->url() === 'https://demo.moj-eracun.hr/apis/v2/send' && $request->data() === [
 		'username' => '10001',
@@ -39,13 +42,38 @@ it('sends the document with the account in the shape the demo service takes, and
 	]);
 });
 
-it('sends to the production service when the environment says so', function () {
+it('refuses the production service outside a production installation, and sends to it when that is allowed', function () {
 	config(['hrEInvoicing.mojEracun.environment' => 'production']);
 	Http::fake([
 		'https://www.moj-eracun.hr/apis/v2/send' => Http::response(['ElectronicId' => 81, 'StatusId' => 30]),
 	]);
 
-	expect(app(MojEracunClient::class)->send('<Invoice/>'))->toBe(['electronicId' => '81', 'status' => 30]);
+	expect(fn () => app(MojEracunClient::class)->send('<Invoice/>'))
+		->toThrow(RuntimeException::class, 'The intermediary\'s production service is refused outside a production installation.');
+
+	Http::assertNothingSent();
+
+	config(['hrEInvoicing.allowProductionAnywhere' => true]);
+
+	expect(app(MojEracunClient::class)->send('<Invoice/>'))->toBe(['electronicId' => '81', 'status' => DocumentStatus::SENT]);
+});
+
+it('calls the service of the account\'s own environment, and sends the environment nowhere', function () {
+	config(['hrEInvoicing.mojEracun.environment' => 'production', 'hrEInvoicing.allowProductionAnywhere' => true]);
+	app()->instance(AccountProvider::class, new class implements AccountProvider
+	{
+		public function account(): ?array
+		{
+			return ['username' => '10001', 'password' => 'tajna', 'companyId' => '12345678903', 'companyBU' => null, 'softwareId' => 'Test-002', 'environment' => 'demo'];
+		}
+	});
+	Http::fake([
+		'https://demo.moj-eracun.hr/apis/v2/send' => Http::response(['ElectronicId' => 82, 'StatusId' => 20]),
+	]);
+
+	expect(app(MojEracunClient::class)->send('<Invoice/>'))->toBe(['electronicId' => '82', 'status' => DocumentStatus::SENT]);
+
+	Http::assertSent(fn (Request $request) => $request->url() === 'https://demo.moj-eracun.hr/apis/v2/send' && !array_key_exists('environment', $request->data()));
 });
 
 it('says which rules a refused document broke, a refusal no new try changes, unlike an answer that never came', function () {
@@ -78,21 +106,36 @@ it('finds a document sent before by its number in the outbox, the latest of that
 
 	$client = app(MojEracunClient::class);
 
-	expect($client->sentDocument('455/P1/1', Carbon::parse('2026-10-22 14:48:09', 'UTC')))->toBe(['electronicId' => '3687375', 'status' => 30])
+	expect($client->sentDocument('455/P1/1', Carbon::parse('2026-10-22 14:48:09', 'UTC')))->toBe(['electronicId' => '3687375', 'status' => DocumentStatus::SENT])
 		->and($client->sentDocument('457/P1/1', Carbon::parse('2026-10-22 14:48:09', 'UTC')))->toBeNull();
 
 	Http::assertSent(fn (Request $request) => $request->url() === 'https://demo.moj-eracun.hr/apis/v2/queryOutbox' && $request['from'] === '2026-10-21' && $request['companyId'] === '12345678903');
 });
 
-it('reads the document status from the outbox list and leaves the fiscalization unknown while the tax authority has said nothing', function () {
+it('reads the document standing from the outbox list and leaves the fiscalization unknown while the tax authority has said nothing', function () {
 	Http::fake([
 		'https://demo.moj-eracun.hr/apis/v2/queryOutbox' => Http::response([['ElectronicId' => 3687370, 'StatusId' => 30, 'StatusName' => 'Poslan']]),
 		'https://demo.moj-eracun.hr/api/fiscalization/statusOutbox' => Http::response(['message' => 'Nije moguće pronaći status poruke o fiskalizaciji.', 'traceId' => 'a2fc9bec'], 404),
 	]);
 
-	expect(app(MojEracunClient::class)->status('3687370'))->toBe(['status' => 30, 'fiscalization' => null, 'error' => null]);
+	expect(app(MojEracunClient::class)->status('3687370'))->toBe(['status' => DocumentStatus::SENT, 'fiscalization' => null, 'error' => null]);
 
 	Http::assertSent(fn (Request $request) => $request->url() === 'https://demo.moj-eracun.hr/apis/v2/queryOutbox' && $request['electronicId'] === 3687370);
+});
+
+it('names a refused, a reported and a delivered document, and says the status name of a refused one as the reason', function () {
+	Http::fake([
+		'https://demo.moj-eracun.hr/apis/v2/queryOutbox' => Http::sequence()
+			->push([['ElectronicId' => 1, 'StatusId' => 50, 'StatusName' => 'Odbijen']])
+			->push([['ElectronicId' => 2, 'StatusId' => 70, 'StatusName' => 'Prijavljen']])
+			->push([['ElectronicId' => 3, 'StatusId' => 40, 'StatusName' => 'Dostavljen']]),
+		'https://demo.moj-eracun.hr/api/fiscalization/statusOutbox' => Http::response([], 404),
+	]);
+	$client = app(MojEracunClient::class);
+
+	expect($client->status('1'))->toBe(['status' => DocumentStatus::REFUSED, 'fiscalization' => null, 'error' => 'Odbijen'])
+		->and($client->status('2')['status'])->toBe(DocumentStatus::REPORTED)
+		->and($client->status('3')['status'])->toBe(DocumentStatus::DELIVERED);
 });
 
 it('takes the tax authority answer about the document itself, the latest one, and passes over the answers about other documents', function () {
@@ -110,7 +153,7 @@ it('takes the tax authority answer about the document itself, the latest one, an
 		]),
 	]);
 
-	expect(app(MojEracunClient::class)->status('3687370'))->toBe(['status' => 40, 'fiscalization' => 1, 'error' => 'S005 Poruka nije u skladu s XML shemom']);
+	expect(app(MojEracunClient::class)->status('3687370'))->toBe(['status' => DocumentStatus::DELIVERED, 'fiscalization' => FiscalizationStatus::FAILED, 'error' => 'S005 Poruka nije u skladu s XML shemom']);
 });
 
 it('reports a payment with the transfer method, and says the tax authority code when it refuses one', function () {

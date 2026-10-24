@@ -4,16 +4,18 @@ namespace GTCrais\HrEInvoicing\Testing;
 
 use DateTimeInterface;
 use GTCrais\HrEInvoicing\Contracts\EInvoiceGateway;
+use GTCrais\HrEInvoicing\DocumentStatus;
 use GTCrais\HrEInvoicing\Exceptions\EInvoiceRefusedException;
 use GTCrais\HrEInvoicing\Exceptions\EInvoiceUnavailableException;
+use GTCrais\HrEInvoicing\FiscalizationStatus;
 use RuntimeException;
 
 /**
  * Answers in place of the intermediary: an identifier for every e-invoice sent, the standing a test set for it,
  * and a record of the payments reported; told to refuse the next few calls, it does, and told to lose the next
- * answer, it keeps the document and fails as a timeout would. The service provider binds it as the gateway, one for
- * the whole run, when config('hrEInvoicing.gateway') is "fake", so a test resets it before it starts and reads what
- * was sent.
+ * answer, it keeps the document and fails as a timeout would. GatewayManager hands it out for every intermediary,
+ * one for the whole run, when config('hrEInvoicing.gateway') is "fake", so a test resets it before it starts and
+ * reads what was sent.
  */
 class FakeEInvoiceGateway implements EInvoiceGateway
 {
@@ -27,11 +29,11 @@ class FakeEInvoiceGateway implements EInvoiceGateway
 
 	public bool $ready = true;
 
-	/** @var array<string, array{status: int, fiscalization: ?int, error: ?string}> */
+	/** @var array<string, array{status: DocumentStatus, fiscalization: ?FiscalizationStatus, error: ?string}> */
 	public array $statuses = [];
 
 	/** The standing a freshly sent document gets */
-	public int $sendStatus = 30;
+	public DocumentStatus $sendStatus = DocumentStatus::SENT;
 
 	/** Sends whose document is kept but whose answer never comes back */
 	public int $answersToLose = 0;
@@ -51,7 +53,7 @@ class FakeEInvoiceGateway implements EInvoiceGateway
 		$this->pings = 0;
 		$this->ready = true;
 		$this->statuses = [];
-		$this->sendStatus = 30;
+		$this->sendStatus = DocumentStatus::SENT;
 		$this->answersToLose = 0;
 		$this->failures = [];
 	}
@@ -93,7 +95,7 @@ class FakeEInvoiceGateway implements EInvoiceGateway
 	/**
 	 * What the intermediary will answer for a document from now on.
 	 */
-	public function setStatus(string $electronicId, int $status, ?int $fiscalization = null, ?string $error = null): void
+	public function setStatus(string $electronicId, DocumentStatus $status, ?FiscalizationStatus $fiscalization = null, ?string $error = null): void
 	{
 		$this->statuses[$electronicId] = ['status' => $status, 'fiscalization' => $fiscalization, 'error' => $error];
 	}
@@ -130,7 +132,7 @@ class FakeEInvoiceGateway implements EInvoiceGateway
 			if (str_contains($xml, '<cbc:ID>' . htmlspecialchars($number, ENT_XML1) . '</cbc:ID>')) {
 				$electronicId = (string) (1001 + $index);
 
-				return ['electronicId' => $electronicId, 'status' => $this->statuses[$electronicId]['status'] ?? 30];
+				return ['electronicId' => $electronicId, 'status' => $this->statuses[$electronicId]['status'] ?? DocumentStatus::SENT];
 			}
 		}
 
@@ -141,7 +143,7 @@ class FakeEInvoiceGateway implements EInvoiceGateway
 	{
 		$this->refuseIfAsked();
 
-		return $this->statuses[$electronicId] ?? ['status' => 30, 'fiscalization' => null, 'error' => null];
+		return $this->statuses[$electronicId] ?? ['status' => DocumentStatus::SENT, 'fiscalization' => null, 'error' => null];
 	}
 
 	public function reportPayment(string $electronicId, string $paidOn, float $amount): void

@@ -12,8 +12,10 @@ interface AccountProvider
 	/**
 	 * The account, or null while any part of it is missing: the username and password, the issuer's OIB as the
 	 * company, its business unit when it has one, and the software identifier Moj-eRačun issued for the software.
+	 * An "environment" of "demo" or "production" names the service the account is on; without it the client's own
+	 * environment stands.
 	 *
-	 * @return array{username: string, password: string, companyId: string, companyBU: ?string, softwareId: string}|null
+	 * @return array{username: string, password: string, companyId: string, companyBU: ?string, softwareId: string, environment?: string}|null
 	 */
 	public function account(): ?array;
 }

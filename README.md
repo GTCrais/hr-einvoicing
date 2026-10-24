@@ -1,14 +1,17 @@
 # HR e-invoicing for Laravel
 
 Croatian e-invoices (Fiskalizacija 2.0) for Laravel: write UBL 2.1 documents under the Croatian CIUS 2025 and send
-them through the Moj-eRačun intermediary.
+them through an information intermediary, Moj-eRačun or ePoslovanje.
 
-*Hrvatski e-računi (Fiskalizacija 2.0) za Laravel: UBL 2.1 dokumenti prema HR CIUS 2025, slanje putem Moj-eRačuna.*
+*Hrvatski e-računi (Fiskalizacija 2.0) za Laravel: UBL 2.1 dokumenti prema HR CIUS 2025, slanje putem Moj-eRačuna ili
+ePoslovanja.*
 
 The package gives you:
 
-- **A Moj-eRačun client**: send a document, look up its status and the tax authority's answer, find a document whose
-  answer was lost, report a payment, test the connection.
+- **A client for each intermediary**, Moj-eRačun and ePoslovanje, behind one gateway contract: send a document, look
+  up its status and the tax authority's answer, find a document whose answer was lost, report a payment, test the
+  connection. Every answer speaks the package's own statuses, whatever the intermediary's codes, so your app does not
+  care which one carried a document.
 - **The parts every Croatian e-invoice shares**, written the way Moj-eRačun's examples write them: the document with its
   namespaces, the Croatian extension (`HRFISK20Data`), the parties by OIB, the VAT breakdown, the totals and the lines.
   You map your own invoices onto them.
@@ -22,7 +25,8 @@ service.
 
 - PHP 8.3+ with the `dom` and `libxml` extensions
 - Laravel 12 or 13
-- A Moj-eRačun account and the software identifier Moj-eRačun issues for your software
+- An account with Moj-eRačun (and the software identifier Moj-eRačun issues for your software) or with ePoslovanje
+  (whose API key the account's control panel shows)
 
 ## Installation
 
@@ -39,56 +43,75 @@ The service provider is discovered automatically.
 
 | Variable | Meaning |
 | --- | --- |
-| `HR_EINVOICING_GATEWAY` | `mojeracun` (default), or `fake` for tests |
+| `HR_EINVOICING_GATEWAY` | `mojeracun` (default), `eposlovanje`, or `fake` for tests |
+| `HR_EINVOICING_ALLOW_PRODUCTION_ANYWHERE` | `false` (default): the production services are refused unless the app runs with `APP_ENV=production` |
 | `MOJ_ERACUN_ENVIRONMENT` | `demo` (default) or `production` |
 | `MOJ_ERACUN_USERNAME` | The Moj-eRačun account's username |
 | `MOJ_ERACUN_PASSWORD` | Its password |
 | `MOJ_ERACUN_OIB` | The issuer's OIB |
 | `MOJ_ERACUN_BUSINESS_UNIT` | The issuer's business unit, if it has one |
 | `MOJ_ERACUN_SOFTWARE_ID` | The software identifier Moj-eRačun issued |
+| `EPOSLOVANJE_ENVIRONMENT` | `demo` (default, the test server) or `production` |
+| `EPOSLOVANJE_API_KEY` | The API key of the ePoslovanje account; a test account's key opens only the test server |
+| `EPOSLOVANJE_OIB` | The issuer's OIB |
+| `EPOSLOVANJE_SOFTWARE_ID` | A software identifier of your own choosing |
 
-`attemptSeconds` (15 by default) caps each call to Moj-eRačun.
+`attemptSeconds` (15 by default) caps each call to the intermediary.
+
+Every intermediary has a demo (test) service and a production one, with different accounts on each. A development
+machine never reaches a production service, whatever its `.env` holds, unless `HR_EINVOICING_ALLOW_PRODUCTION_ANYWHERE`
+is set; a call that would is refused with a `RuntimeException`.
 
 ## Sending e-invoices
 
-Resolve the gateway from the container:
+Resolve the gateway from the container, or ask `GatewayManager` for an intermediary by name:
 
 ```php
 use GTCrais\HrEInvoicing\Contracts\EInvoiceGateway;
+use GTCrais\HrEInvoicing\DocumentStatus;
 use GTCrais\HrEInvoicing\Exceptions\EInvoiceRefusedException;
+use GTCrais\HrEInvoicing\GatewayManager;
 
-$gateway = app(EInvoiceGateway::class);
+$gateway = app(EInvoiceGateway::class);               // the one HR_EINVOICING_GATEWAY names
+$gateway = app(GatewayManager::class)->driver('eposlovanje');
 
 try {
     ['electronicId' => $id, 'status' => $status] = $gateway->send($xml);
 } catch (EInvoiceRefusedException $exception) {
-    // Moj-eRačun refused the document itself (HTTP 400 or 422); the message lists the rules it broke.
+    // The intermediary refused the document itself (HTTP 400 or 422); the message says why.
     // Sending the same document again would be refused again.
 } catch (RuntimeException $exception) {
-    // Moj-eRačun could not be reached or answered with an error; a later try may pass.
+    // The intermediary could not be reached or answered with an error; a later try may pass.
 }
 ```
 
 | Method | What it does |
 | --- | --- |
 | `ready(): bool` | Whether the account is complete |
-| `send(string $xml): array` | Sends the document; returns `electronicId` and Moj-eRačun's `status` |
+| `send(string $xml): array` | Sends the document; returns `electronicId` and its `DocumentStatus` |
 | `sentDocument(string $number, DateTimeInterface $since): ?array` | Finds a document sent since then by its number, for a send whose answer was lost |
-| `status(string $electronicId): array` | The document's `status`, and the tax authority's answer: `fiscalization` (null while unknown, 0 success, 1 failure, 2 waiting) with its `error` |
-| `reportPayment(string $electronicId, string $paidOn, float $amount): void` | Reports a payment by transfer to the tax authority |
+| `status(string $electronicId): array` | The document's `DocumentStatus`, and the tax authority's answer: `fiscalization` (a `FiscalizationStatus`, or null while the intermediary has said nothing) with its `error` |
+| `reportPayment(string $electronicId, string $paidOn, float $amount): void` | Reports a payment by bank transfer to the tax authority |
 | `ping(): void` | Tests the connection; throws `EInvoiceUnavailableException` when the service itself is down |
+
+`DocumentStatus` is `SENT` (with the intermediary, on its way), `DELIVERED` (the buyer has it, approved or paid too),
+`REPORTED` (reported to the tax authority instead, because the buyer takes no e-invoices; Moj-eRačun does this),
+`REFUSED` (the intermediary did not take it; a new try sends it afresh) or `REJECTED` (the intermediary holds it, but it
+will not reach the buyer: the buyer rejected it, or its delivery failed for good; `isHeld()` tells the last two apart).
+`FiscalizationStatus` is `FISCALIZED`, `FAILED` (with the tax authority's code and reason in `error`) or `WAITING`.
 
 Every call throws a `RuntimeException` with the reason when it fails.
 
 ### One account per tenant
 
-The calls carry the configured account. An app that sends for many companies binds its own account provider instead.
-The client asks it again before every call:
+The calls carry the configured account. An app that sends for many companies binds its own account provider instead,
+one per intermediary. The client asks it again before every call, and an account may name its own `environment`, so one
+tenant can be on the demo service while another is live:
 
 ```php
 use GTCrais\HrEInvoicing\MojEracun\Contracts\AccountProvider;
 
-class TenantEInvoiceAccount implements AccountProvider
+class TenantMojEracunAccount implements AccountProvider
 {
     public function account(): ?array
     {
@@ -104,13 +127,21 @@ class TenantEInvoiceAccount implements AccountProvider
             'companyId' => $tenant->oib,
             'companyBU' => null,
             'softwareId' => config('hrEInvoicing.mojEracun.softwareId'),
+            'environment' => $tenant->live ? 'production' : 'demo',
         ];
     }
 }
 
 // In a service provider's register()
-$this->app->bind(AccountProvider::class, TenantEInvoiceAccount::class);
+$this->app->bind(AccountProvider::class, TenantMojEracunAccount::class);
+$this->app->bind(\GTCrais\HrEInvoicing\EPoslovanje\Contracts\AccountProvider::class, TenantEPoslovanjeAccount::class);
 ```
+
+An ePoslovanje account is `['apiKey' => …, 'oib' => …, 'softwareId' => …]`, with the same optional `environment`.
+
+When each tenant chooses its intermediary, keep the name with every document you send and ask
+`GatewayManager::driver($name)` for that one when you follow the document up; `GatewayManager::INTERMEDIARIES` lists
+the names.
 
 ## Writing documents
 
@@ -178,15 +209,17 @@ For the other kinds of documents:
 An issuer outside the VAT system passes `vatRegistered: false`, gives every line an `E` category with the reason, and is
 named by its OIB under the `FRE` scheme. The Croatian extension is written whenever a category is not standard.
 
-Moj-eRačun signs the documents, so the signature block is left empty for it.
+The intermediaries sign the documents, so the signature block is left empty for them.
 
 ## Testing
 
 Set `HR_EINVOICING_GATEWAY=fake` in `phpunit.xml`. The gateway is then a `Testing\FakeEInvoiceGateway`, one for the
-whole run:
+whole run and the same for every intermediary name:
 
 ```php
 use GTCrais\HrEInvoicing\Contracts\EInvoiceGateway;
+use GTCrais\HrEInvoicing\DocumentStatus;
+use GTCrais\HrEInvoicing\FiscalizationStatus;
 use GTCrais\HrEInvoicing\Testing\UblSchema;
 
 beforeEach(function () {
@@ -198,6 +231,7 @@ it('sends the invoice', function () {
     $this->gateway->failNext();        // the next call fails as a timeout would
     $this->gateway->refuseNext();      // the next document is refused
     $this->gateway->loseNextAnswer();  // the next document arrives, but its answer is lost
+    $this->gateway->setStatus('1001', DocumentStatus::DELIVERED, FiscalizationStatus::FISCALIZED);
 
     // ... send
 
@@ -206,7 +240,7 @@ it('sends the invoice', function () {
 });
 ```
 
-The fake also records `payments` and `pings`, and `setStatus()` sets what it answers for a document.
+The fake also records `payments` and `pings`.
 
 `UblSchema::errors($xml)` checks a document against the UBL 2.1 Invoice or CreditNote schema with the Croatian
 extension and returns what is wrong, or an empty array.
@@ -214,7 +248,7 @@ extension and returns what is wrong, or an empty array.
 ## What it does not do
 
 - It issues e-invoices; it does not receive them.
-- It talks to Moj-eRačun only. `EInvoiceGateway` leaves room for other intermediaries.
+- It talks to Moj-eRačun and ePoslovanje. `EInvoiceGateway` leaves room for other intermediaries.
 - It writes nothing outside the scope of VAT.
 
 ## Schemas

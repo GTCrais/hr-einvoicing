@@ -1,7 +1,7 @@
 {
     "name": "gtcrais/hr-einvoicing",
-    "description": "Croatian e-invoices (Fiskalizacija 2.0) for Laravel: UBL 2.1 documents under the HR CIUS 2025, sent through Moj-eRačun",
-    "keywords": ["laravel", "e-invoice", "e-račun", "eracun", "UBL", "EN 16931", "HR CIUS", "Moj-eRačun", "fiskalizacija"],
+    "description": "Croatian e-invoices (Fiskalizacija 2.0) for Laravel: UBL 2.1 documents under the HR CIUS 2025, sent through Moj-eRačun or ePoslovanje",
+    "keywords": ["laravel", "e-invoice", "einvoicing", "e-invoicing", "e-račun", "eracun", "UBL", "EN 16931", "HR CIUS", "Moj-eRačun", "ePoslovanje", "fiskalizacija"],
     "authors": [
         {
             "name": "Tomislav Modrić",
