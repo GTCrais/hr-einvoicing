@@ -98,6 +98,41 @@ it('names an issuer outside the VAT system by its OIB under the FRE scheme, with
 		->and($xpath->evaluate('count(//cbc:TaxExemptionReasonCode)'))->toBe(0.0);
 });
 
+it('gives lines exempt on different grounds one breakdown naming every ground, each line keeping its own', function () {
+	$health = 'Oslobođeno PDV-a prema čl. 39. Zakona o PDV-u';
+	$outside = 'Nije u sustavu PDV-a prema čl. 90. Zakona o PDV-u';
+	$build = fn (array $lines) => (new ExampleInvoiceBuilder)->build(exampleInvoice(['vatRegistered' => false, 'lines' => $lines]));
+
+	$xml = $build([
+		['name' => 'Sistematski pregled', 'quantity' => 1, 'net' => 80.0, 'tax' => 0.0, 'kpd' => '86.22.19', 'category' => exemption('VATEX-EU-132', $health)],
+		['name' => 'Krema za sunčanje', 'quantity' => 2, 'net' => 45.0, 'tax' => 0.0, 'kpd' => '20.42.19', 'category' => exemption(null, $outside)],
+		['name' => 'Kontrolni pregled', 'quantity' => 1, 'net' => 40.0, 'tax' => 0.0, 'kpd' => '86.22.19', 'category' => exemption('VATEX-EU-132', $health)],
+	]);
+	$xpath = exampleXpath($xml);
+
+	// Exactly one breakdown for the exemption (EN 16931 BR-E-01) over every exempt line (BR-E-08), in the extension too;
+	// the code only one of the grounds has is left to its lines
+	expect(UblSchema::errors($xml))->toBe([])
+		->and($xpath->evaluate('count(/inv:Invoice/cac:TaxTotal/cac:TaxSubtotal)'))->toBe(1.0)
+		->and($xpath->evaluate('string(/inv:Invoice/cac:TaxTotal/cac:TaxSubtotal/cbc:TaxableAmount)'))->toBe('165.00')
+		->and($xpath->evaluate('string(/inv:Invoice/cac:TaxTotal/cac:TaxSubtotal/cac:TaxCategory/cbc:TaxExemptionReason)'))->toBe($health . '; ' . $outside)
+		->and($xpath->evaluate('count(/inv:Invoice/cac:TaxTotal/cac:TaxSubtotal/cac:TaxCategory/cbc:TaxExemptionReasonCode)'))->toBe(0.0)
+		->and($xpath->evaluate('count(//hrextac:HRTaxTotal/hrextac:HRTaxSubtotal)'))->toBe(1.0)
+		->and($xpath->evaluate('string(//hrextac:HRTaxSubtotal/cbc:TaxableAmount)'))->toBe('165.00')
+		->and($xpath->evaluate('string(/inv:Invoice/cac:InvoiceLine[1]/cac:Item/cac:ClassifiedTaxCategory/cbc:TaxExemptionReasonCode)'))->toBe('VATEX-EU-132')
+		->and($xpath->evaluate('string(/inv:Invoice/cac:InvoiceLine[2]/cac:Item/cac:ClassifiedTaxCategory/cbc:TaxExemptionReason)'))->toBe($outside);
+
+	// Lines that share their ground and code keep both on the one breakdown
+	$shared = exampleXpath($build([
+		['name' => 'Sistematski pregled', 'quantity' => 1, 'net' => 80.0, 'tax' => 0.0, 'kpd' => '86.22.19', 'category' => exemption('VATEX-EU-132', $health)],
+		['name' => 'Kontrolni pregled', 'quantity' => 1, 'net' => 40.0, 'tax' => 0.0, 'kpd' => '86.22.19', 'category' => exemption('VATEX-EU-132', $health)],
+	]));
+
+	expect($shared->evaluate('count(/inv:Invoice/cac:TaxTotal/cac:TaxSubtotal)'))->toBe(1.0)
+		->and($shared->evaluate('string(/inv:Invoice/cac:TaxTotal/cac:TaxSubtotal/cac:TaxCategory/cbc:TaxExemptionReasonCode)'))->toBe('VATEX-EU-132')
+		->and($shared->evaluate('string(/inv:Invoice/cac:TaxTotal/cac:TaxSubtotal/cac:TaxCategory/cbc:TaxExemptionReason)'))->toBe($health);
+});
+
 it('leaves the Croatian extension out when every line is at a standard rate', function () {
 	$xml = (new ExampleInvoiceBuilder)->build(exampleInvoice(['lines' => [
 		['name' => 'Krema za sunčanje', 'quantity' => 1, 'net' => 20.0, 'tax' => 5.0, 'kpd' => '20.42.19', 'category' => standardRate(25.0)],

@@ -44,6 +44,7 @@ The service provider is discovered automatically.
 | Variable | Meaning |
 | --- | --- |
 | `HR_EINVOICING_GATEWAY` | `mojeracun` (default), `eposlovanje`, or `fake` for tests |
+| `HR_EINVOICING_FAKE` | `false` (default); `true` has the fake answer for the intermediary the gateway names, as that intermediary |
 | `HR_EINVOICING_ALLOW_PRODUCTION_ANYWHERE` | `false` (default): the production services are refused unless the app runs with `APP_ENV=production` |
 | `MOJ_ERACUN_ENVIRONMENT` | `demo` (default) or `production` |
 | `MOJ_ERACUN_USERNAME` | The Moj-eRačun account's username |
@@ -78,8 +79,9 @@ $gateway = app(GatewayManager::class)->driver('eposlovanje');
 try {
     ['electronicId' => $id, 'status' => $status] = $gateway->send($xml);
 } catch (EInvoiceRefusedException $exception) {
-    // The intermediary refused the document itself (HTTP 400 or 422); the message says why.
-    // Sending the same document again would be refused again.
+    // The intermediary refused the document itself (the rules it broke); the message says why.
+    // Sending the same document again would be refused again. A refusal of the account (not active,
+    // no funds, an unknown key) is a RuntimeException instead: it passes once the account is put right.
 } catch (RuntimeException $exception) {
     // The intermediary could not be reached or answered with an error; a later try may pass.
 }
@@ -89,16 +91,22 @@ try {
 | --- | --- |
 | `ready(): bool` | Whether the account is complete |
 | `send(string $xml): array` | Sends the document; returns `electronicId` and its `DocumentStatus` |
-| `sentDocument(string $number, DateTimeInterface $since): ?array` | Finds a document sent since then by its number, for a send whose answer was lost |
-| `status(string $electronicId): array` | The document's `DocumentStatus`, and the tax authority's answer: `fiscalization` (a `FiscalizationStatus`, or null while the intermediary has said nothing) with its `error` |
-| `reportPayment(string $electronicId, string $paidOn, float $amount): void` | Reports a payment by bank transfer to the tax authority |
-| `ping(): void` | Tests the connection; throws `EInvoiceUnavailableException` when the service itself is down |
+| `sentDocument(string $number, DateTimeInterface $since, ?string $issueDate = null): ?array` | Finds a document sent since then by its number, for a send whose answer was lost; numbers start again every year, so pass the day of issue (`cbc:IssueDate`, Y-m-d) to tell one year's document from the next |
+| `status(string $electronicId): array` | The document's `DocumentStatus`; the tax authority's answer about it, `fiscalization` (a `FiscalizationStatus`, or null while the intermediary has said nothing) with its `error`; and its answer to the latest payment report, `payment` with `paymentError`. The reasons are null where the intermediary gave none. When the standing is known but the tax authority's answers cannot be read (Moj-eRačun reads them with a second call), `answersError` says why and `fiscalization` and `payment` are unknown rather than none; take a null `payment` for a report never made only when `answersError` is null |
+| `reportPayment(string $electronicId, string $paidOn, float $amount): void` | Reports a payment by bank transfer to the tax authority. Moj-eRačun answers with the tax authority's word at once (a refusal is thrown); ePoslovanje queues the report and the answer comes later in `status()`'s `payment` |
+| `ping(): void` | Tests the connection, and on ePoslovanje that the account fiscalizes its outgoing documents itself; throws `EInvoiceUnavailableException` when the service itself is down |
+
+A gateway that also implements `Contracts\FiscalizesAgain` (ePoslovanje, and the fake as ePoslovanje or under its own name) takes `fiscalizeAgain($electronicId)`:
+a new request to the tax authority for a document it refused, once the cause is put right (with S006, the issuer had not
+authorized the intermediary in the FiskAplikacija).
 
 `DocumentStatus` is `SENT` (with the intermediary, on its way), `DELIVERED` (the buyer has it, approved or paid too),
 `REPORTED` (reported to the tax authority instead, because the buyer takes no e-invoices; Moj-eRačun does this),
 `REFUSED` (the intermediary did not take it; a new try sends it afresh) or `REJECTED` (the intermediary holds it, but it
 will not reach the buyer: the buyer rejected it, or its delivery failed for good; `isHeld()` tells the last two apart).
-`FiscalizationStatus` is `FISCALIZED`, `FAILED` (with the tax authority's code and reason in `error`) or `WAITING`.
+`FiscalizationStatus` is `FISCALIZED`, `FAILED` (with the tax authority's code and reason in `error`) or `WAITING`. On
+ePoslovanje a fiscalization counts as taken only when it is marked a success (it marks a refused one completed too), and
+once taken it stays taken whatever a later duplicate request says.
 
 Every call throws a `RuntimeException` with the reason when it fails.
 
@@ -139,9 +147,12 @@ $this->app->bind(\GTCrais\HrEInvoicing\EPoslovanje\Contracts\AccountProvider::cl
 
 An ePoslovanje account is `['apiKey' => …, 'oib' => …, 'softwareId' => …]`, with the same optional `environment`.
 
-When each tenant chooses its intermediary, keep the name with every document you send and ask
-`GatewayManager::driver($name)` for that one when you follow the document up; `GatewayManager::INTERMEDIARIES` lists
-the names.
+When a tenant's intermediary or service can change, keep both with every document you send and follow the document up
+where it went: `GatewayManager::driver($name, $environment)` hands out a client held to that service.
+`GatewayManager::INTERMEDIARIES` lists the names. A provider that keeps an account per service implements
+`Contracts\AccountsByEnvironment` (`accountFor($environment)`), and the held client calls with that service's account;
+the configured providers answer only for the service they are configured for, so a document of the other service has
+no account to go with (`ready()` is false).
 
 ## Writing documents
 
@@ -193,9 +204,12 @@ The arrays the methods take:
   company, which also gets its VAT identifier).
 - **A line**: `id` (1, 2, …), `name`, `quantity`, `net` (after discounts), `tax`, `unit` (the net unit price), `kpd`
   (the KPD 2025 classification code, or null) and `category`.
-- **A VAT category**: `key` (anything that tells categories apart), `id` (`S` standard, `E` exempt), `name`
-  (`HR:PDV25`, `HR:E`), `percent`, and for an exemption its `code` (VATEX) and `reason`. `categories()` adds up each
-  category's `base` and `tax` from the lines and puts the standard rates first.
+- **A VAT category**: `id` (`S` standard, `E` exempt), `name` (`HR:PDV25`, `HR:E`), `percent`, and for an exemption
+  its `code` (VATEX) and `reason`; a `key` may come along, which `categories()` sets itself. `categories()` adds up each
+  category's `base` and `tax` from the lines and puts the standard rates first. EN 16931 takes one breakdown per
+  standard rate and exactly one for every other category (BR-E-01), so lines exempt on different grounds share one
+  breakdown: its reason names every ground (joined with "; "), and it keeps the VATEX code only when every line has
+  the same one. Each line still carries its own code and reason.
 
 For the other kinds of documents:
 
@@ -213,8 +227,19 @@ The intermediaries sign the documents, so the signature block is left empty for 
 
 ## Testing
 
-Set `HR_EINVOICING_GATEWAY=fake` in `phpunit.xml`. The gateway is then a `Testing\FakeEInvoiceGateway`, one for the
-whole run and the same for every intermediary name:
+Set `HR_EINVOICING_GATEWAY=fake` in `phpunit.xml`, or keep the gateway naming your intermediary and set
+`HR_EINVOICING_FAKE=true`. The gateway (`app(EInvoiceGateway::class)`, and `driver()` without a name) is then a
+`Testing\FakeEInvoiceGateway`, one for the whole run, which stands for no intermediary. `GatewayManager::driver($name, $environment)` hands it out as
+that intermediary on that service (`Testing\FakeIntermediary`; a name the package does not know is refused, as without
+the fake), so an app's tests see each intermediary as it is:
+
+- it can do what the real client can: `FiscalizesAgain` only as ePoslovanje (and under the fake's own name);
+- it is ready, and calls, only where the real client's account provider gives an account, by the same rules;
+- every call is recorded with the intermediary and the service it went to;
+- a document is found only through the intermediary and the service it was sent through; asking another for it finds
+  nothing, as the real one knows nothing of it.
+
+The fake itself, as a test asks it, stands for no intermediary and sees everything:
 
 ```php
 use GTCrais\HrEInvoicing\Contracts\EInvoiceGateway;
@@ -240,7 +265,9 @@ it('sends the invoice', function () {
 });
 ```
 
-The fake also records `payments` and `pings`.
+The fake also records `payments`, `pings`, the documents asked to be fiscalized again (`refiscalized`), and every call
+with the intermediary and the service it stood in for (`calls`), so a test can see a document followed up where it went.
+`paymentAnswer` is what `status()` tells of a payment once it is reported (fiscalized unless a test says otherwise).
 
 `UblSchema::errors($xml)` checks a document against the UBL 2.1 Invoice or CreditNote schema with the Croatian
 extension and returns what is wrong, or an empty array.
@@ -249,6 +276,10 @@ extension and returns what is wrong, or an empty array.
 
 - It issues e-invoices; it does not receive them.
 - It talks to Moj-eRačun and ePoslovanje. `EInvoiceGateway` leaves room for other intermediaries.
+- ePoslovanje refuses a buyer that is not in the tax authority's address registry (AMS) at send, where Moj-eRačun reports
+  the invoice to the tax authority itself (`REPORTED`). The package does not report such an invoice through ePoslovanje
+  instead (its `/ereporting/reportdocument`, type `IR`): its test server does not check the registry, so the path could
+  not be tried. The refusal comes back as the document's; report the invoice another way.
 - It writes nothing outside the scope of VAT.
 
 ## Schemas

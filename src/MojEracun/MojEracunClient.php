@@ -40,6 +40,9 @@ class MojEracunClient implements EInvoiceGateway
 	/** The tax authority's answers about an e-invoice it was given: through the e-invoice exchange, or as an eReport */
 	protected const array FISCALIZATION_MESSAGE_TYPES = [0, 4];
 
+	/** The tax authority's answer to a report of the e-invoice's payment (markPaid) */
+	protected const int PAYMENT_MESSAGE_TYPE = 3;
+
 	public function __construct(
 		protected AccountProvider $accounts,
 		protected string $environment = 'demo',
@@ -48,12 +51,12 @@ class MojEracunClient implements EInvoiceGateway
 
 	public function ready(): bool
 	{
-		return $this->accounts->account() !== null;
+		return $this->accountOf($this->accounts) !== null;
 	}
 
 	public function send(string $xml): array
 	{
-		$document = $this->post('/apis/v2/send', ['file' => $xml]);
+		$document = $this->post('/apis/v2/send', ['file' => $xml], refusable: true);
 		$electronicId = $this->value($document, 'ElectronicId');
 
 		if (blank($electronicId)) {
@@ -64,9 +67,10 @@ class MojEracunClient implements EInvoiceGateway
 	}
 
 	/**
-	 * Looked up in the outbox from the day before the first try on, by the number the document carries.
+	 * Looked up in the outbox from the day before the first try on, by the number the document carries and, when
+	 * given, the day it was issued ("Issued").
 	 */
-	public function sentDocument(string $number, DateTimeInterface $since): ?array
+	public function sentDocument(string $number, DateTimeInterface $since, ?string $issueDate = null): ?array
 	{
 		$documents = $this->post('/apis/v2/queryOutbox', [
 			'from' => CarbonImmutable::instance($since)->subDay()->toDateString(),
@@ -74,7 +78,8 @@ class MojEracunClient implements EInvoiceGateway
 		], quietlyMissing: true);
 
 		$document = collect(array_is_list($documents) ? $documents : [$documents])
-			->filter(fn ($row) => is_array($row) && (string) $this->value($row, 'DocumentNr') === $number && filled($this->value($row, 'ElectronicId')))
+			->filter(fn ($row) => is_array($row) && (string) $this->value($row, 'DocumentNr') === $number && filled($this->value($row, 'ElectronicId'))
+				&& $this->issuedOn($this->value($row, 'Issued'), $issueDate))
 			->sortByDesc(fn (array $row) => (int) $this->value($row, 'ElectronicId'))
 			->first();
 
@@ -92,13 +97,25 @@ class MojEracunClient implements EInvoiceGateway
 		}
 
 		$status = $this->documentStatus($this->value($document, 'StatusId'));
-		[$fiscalization, $error] = $this->fiscalization($electronicId);
+
+		// The tax authority's answers come from a call of their own: one that fails leaves the standing known and the
+		// answers unknown (answersError), never read as none
+		try {
+			$messages = $this->taxAuthorityMessages($electronicId);
+			$answersError = null;
+		} catch (RuntimeException $exception) {
+			$messages = [];
+			$answersError = $exception->getMessage();
+		}
+
+		[$fiscalization, $error] = $this->latestAnswer($messages, self::FISCALIZATION_MESSAGE_TYPES);
+		[$payment, $paymentError] = $this->latestAnswer($messages, [self::PAYMENT_MESSAGE_TYPE]);
 
 		if ($status === DocumentStatus::REFUSED && $error === null) {
 			$error = trim((string) ($this->value($document, 'StatusName') ?? '')) ?: null;
 		}
 
-		return ['status' => $status, 'fiscalization' => $fiscalization, 'error' => $error];
+		return ['status' => $status, 'fiscalization' => $fiscalization, 'error' => $error, 'payment' => $payment, 'paymentError' => $paymentError, 'answersError' => $answersError];
 	}
 
 	public function reportPayment(string $electronicId, string $paidOn, float $amount): void
@@ -113,7 +130,7 @@ class MojEracunClient implements EInvoiceGateway
 
 	public function ping(): void
 	{
-		$account = $this->accounts->account() ?? throw new RuntimeException('The intermediary account is not set up.');
+		$account = $this->accountOf($this->accounts) ?? throw new RuntimeException('The intermediary account is not set up.');
 
 		// The service answers its ping without the account; while it does not, the account cannot be checked
 		try {
@@ -126,8 +143,18 @@ class MojEracunClient implements EInvoiceGateway
 			throw new EInvoiceUnavailableException('HTTP ' . $response->status());
 		}
 
-		// The account itself is proven by a query that needs it
-		$this->post('/apis/v2/queryOutbox', ['from' => CarbonImmutable::now()->subDay()->toDateString(), 'to' => CarbonImmutable::now()->toDateString()]);
+		// The account itself is proven by a query that needs it; an empty outbox answers 404 "Nema dokumenata.", which
+		// the service gives only to an account it took
+		$this->post('/apis/v2/queryOutbox', ['from' => CarbonImmutable::now()->subDay()->toDateString(), 'to' => CarbonImmutable::now()->toDateString()], quietlyMissing: true);
+	}
+
+	/**
+	 * Whether a document the outbox says was issued then ("2026-01-28T00:00:00") is of the day asked for; any is when
+	 * no day is asked for or the outbox names none.
+	 */
+	protected function issuedOn(mixed $issued, ?string $issueDate): bool
+	{
+		return $issueDate === null || blank($issued) || substr((string) $issued, 0, 10) === $issueDate;
 	}
 
 	/**
@@ -144,24 +171,36 @@ class MojEracunClient implements EInvoiceGateway
 	}
 
 	/**
-	 * The tax authority's latest answer about the e-invoice, or nothing while it has given none: taken, refused with
-	 * its code and reason, or waiting.
+	 * The tax authority's answers about the e-invoice, each with its type; none while it has given none (the service's
+	 * 404). Any other failure is thrown: a standing without the answers would tell a payment already reported as one
+	 * never reported, and an app that reports it again on that reports the money twice.
 	 *
-	 * @return array{0: ?FiscalizationStatus, 1: ?string}
+	 * @return list<array<string, mixed>>
 	 */
-	protected function fiscalization(string $electronicId): array
+	protected function taxAuthorityMessages(string $electronicId): array
 	{
-		try {
-			$documents = $this->post('/api/fiscalization/statusOutbox', ['electronicId' => (int) $electronicId], quietlyMissing: true);
-		} catch (RuntimeException) {
-			// The answer may not be there yet, or the service may be down; the document's own status stands either way
-			return [null, null];
-		}
+		$documents = $this->post('/api/fiscalization/statusOutbox', ['electronicId' => (int) $electronicId], quietlyMissing: true);
 
-		$latest = collect(array_is_list($documents) ? $documents : [$documents])
+		return collect(array_is_list($documents) ? $documents : [$documents])
 			->filter(fn ($row) => is_array($row) && (string) $this->value($row, 'electronicId') === $electronicId)
 			->flatMap(fn (array $row) => (array) ($this->value($row, 'messages') ?? []))
-			->filter(fn ($message) => is_array($message) && in_array((int) $this->value($message, 'messageType'), self::FISCALIZATION_MESSAGE_TYPES, true))
+			->filter(fn ($message) => is_array($message))
+			->values()
+			->all();
+	}
+
+	/**
+	 * The latest of the tax authority's answers of the given types: taken, refused with its code and reason, or
+	 * waiting; nothing while there is none.
+	 *
+	 * @param  list<array<string, mixed>>  $messages
+	 * @param  list<int>  $types
+	 * @return array{0: ?FiscalizationStatus, 1: ?string}
+	 */
+	protected function latestAnswer(array $messages, array $types): array
+	{
+		$latest = collect($messages)
+			->filter(fn (array $message) => in_array((int) $this->value($message, 'messageType'), $types, true))
 			->sortBy(fn (array $message) => (string) $this->value($message, 'dateOfFiscalization'))
 			->last();
 
@@ -177,16 +216,16 @@ class MojEracunClient implements EInvoiceGateway
 	}
 
 	/**
-	 * The reason the tax authority gave for refusing, with its code.
+	 * The reason the tax authority gave for refusing, with its code; null when it gave none.
 	 *
 	 * @param  array<string, mixed>  $message
 	 */
-	protected function messageError(array $message): string
+	protected function messageError(array $message): ?string
 	{
 		$code = trim((string) $this->value($message, 'errorCode'));
 		$description = trim((string) ($this->value($message, 'errorCodeDescription') ?: $this->value($message, 'message')));
 
-		return trim($code . ' ' . $description) ?: 'The tax authority refused the e-invoice.';
+		return trim($code . ' ' . $description) ?: null;
 	}
 
 	/**
@@ -196,9 +235,9 @@ class MojEracunClient implements EInvoiceGateway
 	 * @param  array<string, mixed>  $payload
 	 * @return array<int|string, mixed>
 	 */
-	protected function post(string $path, array $payload, bool $quietlyMissing = false): array
+	protected function post(string $path, array $payload, bool $quietlyMissing = false, bool $refusable = false): array
 	{
-		$account = $this->accounts->account() ?? throw new RuntimeException('The intermediary account is not set up.');
+		$account = $this->accountOf($this->accounts) ?? throw new RuntimeException('The intermediary account is not set up.');
 		$url = $this->url($path, $account);
 
 		// The service's environment is the account's affair, not the service's
@@ -217,8 +256,9 @@ class MojEracunClient implements EInvoiceGateway
 			return [];
 		}
 
-		// A document it could not take is refused for good; anything else may pass on a later try
-		if (in_array($response->status(), [400, 422], true)) {
+		// A document it could not take is refused for good; anything else, and any other call it refuses, may pass on a
+		// later try
+		if ($refusable && in_array($response->status(), [400, 422], true)) {
 			throw new EInvoiceRefusedException($this->failure($response));
 		}
 

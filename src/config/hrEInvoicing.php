@@ -20,9 +20,15 @@ return [
 	| allowProductionAnywhere is true, so a development machine never reaches
 	| it, whatever its .env holds.
 	|
+	| "fake", switched on, has the fake answer for every intermediary asked
+	| for by name, as that intermediary, the gateway keeping the name of the
+	| one the suite stands in for; the gateway itself is the fake alone.
+	|
 	*/
 
 	'gateway' => env('HR_EINVOICING_GATEWAY', 'mojeracun'),
+
+	'fake' => (bool) env('HR_EINVOICING_FAKE', false),
 
 	'attemptSeconds' => 15,
 

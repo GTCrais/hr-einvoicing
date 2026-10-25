@@ -10,6 +10,9 @@ use GTCrais\HrEInvoicing\MojEracun\ConfigAccountProvider;
 use GTCrais\HrEInvoicing\MojEracun\Contracts\AccountProvider;
 use GTCrais\HrEInvoicing\MojEracun\MojEracunClient;
 use GTCrais\HrEInvoicing\Testing\FakeEInvoiceGateway;
+use GTCrais\HrEInvoicing\Testing\FakeIntermediary;
+use Illuminate\Http\Client\Request;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\ServiceProvider;
 
 it('binds the configured intermediary\'s client as the gateway, and the fake, one for the whole run, when the configuration says so', function () {
@@ -23,8 +26,11 @@ it('binds the configured intermediary\'s client as the gateway, and the fake, on
 
 	expect(app(EInvoiceGateway::class))->toBeInstanceOf(FakeEInvoiceGateway::class)
 		->and(app(EInvoiceGateway::class))->toBe(app(EInvoiceGateway::class))
-		->and(app(GatewayManager::class)->driver('mojeracun'))->toBe(app(EInvoiceGateway::class))
-		->and(app(GatewayManager::class)->driver('eposlovanje'))->toBe(app(EInvoiceGateway::class));
+		->and(app(EInvoiceGateway::class))->toBe(app(GatewayManager::class)->fake())
+		// Each intermediary is that one fake as the intermediary, once for the run
+		->and(app(GatewayManager::class)->driver('mojeracun'))->toBeInstanceOf(FakeIntermediary::class)
+		->and(app(GatewayManager::class)->driver('mojeracun'))->toBe(app(GatewayManager::class)->driver('mojeracun'))
+		->and(app(GatewayManager::class)->driver('eposlovanje', 'demo'))->toBeInstanceOf(FakeIntermediary::class);
 });
 
 it('hands out each intermediary\'s gateway by name, once, and knows which names are intermediaries', function () {
@@ -92,12 +98,22 @@ it('calls with the account the app binds, one per tenant say, and asks for it be
 	app()->instance(AccountProvider::class, $accounts);
 
 	$client = app(MojEracunClient::class);
+	Http::fake(['https://demo.moj-eracun.hr/apis/v2/send' => Http::response(['ElectronicId' => 1, 'StatusId' => 30])]);
 
 	expect($client->ready())->toBeFalse();
 
-	$accounts->tenant = 'sunce';
+	// The same client sends with whichever account the provider gives at the moment of the call
+	foreach (['sunce', 'mjesec'] as $tenant) {
+		$accounts->tenant = $tenant;
 
-	expect($client->ready())->toBeTrue();
+		expect($client->ready())->toBeTrue();
+
+		$client->send('<Invoice/>');
+
+		Http::assertSent(fn (Request $request) => $request['username'] === $tenant);
+	}
+
+	Http::assertSentCount(2);
 });
 
 it('offers its configuration for publishing', function () {

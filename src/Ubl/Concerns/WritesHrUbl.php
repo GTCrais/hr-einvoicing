@@ -15,8 +15,8 @@ use GTCrais\HrEInvoicing\Ubl\HrUbl;
  * as the rules forbid empty ones.
  *
  * A VAT category is an array of the id ("S" standard, "E" exempt), the Croatian name ("HR:PDV25", "HR:E"), the
- * percent, the exemption's code and reason (null for a standard rate) and a key that tells categories apart; the
- * totals add "base" and "tax" to it. A party is an array of its OIB, legal name, street, city, postal code and country.
+ * percent and the exemption's code and reason (null for a standard rate); categories() groups the lines by id and
+ * rate and adds "base" and "tax" to each. A party is an array of its OIB, legal name, street, city, postal code and country.
  */
 trait WritesHrUbl
 {
@@ -219,7 +219,10 @@ trait WritesHrUbl
 	}
 
 	/**
-	 * The lines' categories with their bases and VAT added up, standard rates first, the highest first.
+	 * The lines' categories with their bases and VAT added up, standard rates first, the highest first. EN 16931 takes
+	 * one breakdown per standard rate and exactly one for every other category (BR-E-01, BR-Z-01, BR-AE-01 and the
+	 * rest), so lines exempt on different grounds share one, which names every ground and keeps the exemption code
+	 * only when they all have the same one; each line still carries its own.
 	 *
 	 * @param  list<array<string, mixed>>  $lines
 	 * @return list<array<string, mixed>>
@@ -227,13 +230,29 @@ trait WritesHrUbl
 	protected function categories(array $lines): array
 	{
 		$categories = [];
+		$reasons = [];
 
 		foreach ($lines as $line) {
-			$key = $line['category']['key'];
+			$category = $line['category'];
+			$key = $category['id'] === 'S' ? 'S|' . $this->percent((float) $category['percent']) : $category['id'];
 
-			$categories[$key] ??= [...$line['category'], 'base' => 0.0, 'tax' => 0.0];
+			if (!isset($categories[$key])) {
+				$categories[$key] = [...$category, 'key' => $key, 'base' => 0.0, 'tax' => 0.0];
+				$reasons[$key] = [];
+			} elseif (($categories[$key]['code'] ?? null) !== ($category['code'] ?? null)) {
+				$categories[$key]['code'] = null;
+			}
+
+			if (($category['reason'] ?? null) !== null && $category['reason'] !== '') {
+				$reasons[$key][$category['reason']] = true;
+			}
+
 			$categories[$key]['base'] = round($categories[$key]['base'] + $line['net'], 2);
 			$categories[$key]['tax'] = round($categories[$key]['tax'] + $line['tax'], 2);
+		}
+
+		foreach ($categories as $key => $category) {
+			$categories[$key]['reason'] = $reasons[$key] === [] ? null : implode('; ', array_keys($reasons[$key]));
 		}
 
 		uasort($categories, fn (array $a, array $b) => [$a['id'] !== 'S', -$a['percent']] <=> [$b['id'] !== 'S', -$b['percent']]);
