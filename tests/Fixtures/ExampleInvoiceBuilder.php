@@ -50,7 +50,7 @@ class ExampleInvoiceBuilder
 		}
 
 		$this->supplierParty($root, $invoice['supplier'], $invoice['vatRegistered'], $invoice['supplier']['oib'], $invoice['operator']);
-		$this->customerParty($root, $invoice['customer']);
+		$this->customerParty($root, $invoice['customer'], withVatIdentifier: $invoice['vatRegistered']);
 
 		if (!$creditNote) {
 			$this->delivery($root, substr($invoice['issuedAt'], 0, 10));

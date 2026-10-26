@@ -91,8 +91,8 @@ try {
 | Method | What it does |
 | --- | --- |
 | `ready(): bool` | Whether the account is complete |
-| `send(string $xml): array` | Sends the document; returns `electronicId` and its `DocumentStatus` |
-| `sentDocument(string $number, DateTimeInterface $since, ?string $issueDate = null): ?array` | Finds a document sent since then by its number, for a send whose answer was lost; numbers start again every year, so pass the day of issue (`cbc:IssueDate`, Y-m-d) to tell one year's document from the next |
+| `send(string $xml): array` | Sends the document; returns `electronicId` and its `DocumentStatus`. A document whose number the intermediary holds already for the year (ePoslovanje's "already exists", Moj-eRačun's "already exists with EID=…") is refused with an `EInvoiceRefusedException`, as a document breaking the rules is; an app that sent it minutes after a try whose answer was lost looks it up instead |
+| `sentDocument(string $number, DateTimeInterface $since, ?string $issueDate = null): ?array` | Finds a document sent since then by its number, for a send whose answer was lost; numbers start again every year, so pass the day of issue (`cbc:IssueDate`, Y-m-d) to tell one year's document from the next. Moj-eRačun is asked for that number of that year alone (its `InvoiceNumber` and `InvoiceYear` filters), so the answer is never a page of the outbox the document may be missing from |
 | `status(string $electronicId): array` | The document's `DocumentStatus`; the tax authority's answer about it, `fiscalization` (a `FiscalizationStatus`, or null while the intermediary has said nothing) with its `error`; and its answer to the latest payment report, `payment` with `paymentError`; and `paymentReports`, how many payment reports the intermediary holds of the document (every one it took, those the tax authority refused included), which tells an app that reports more than one payment of a document (one taken back with a negative report, then reported again) whether a report whose answer was lost reached it. The reasons are null where the intermediary gave none. When the standing is known but the tax authority's answers cannot be read (Moj-eRačun reads them with a second call), `answersError` says why and `fiscalization`, `payment` and `paymentReports` are unknown rather than none; take a null `payment` for a report never made only when `answersError` is null |
 | `reportPayment(string $electronicId, string $paidOn, float $amount): void` | Reports a payment by bank transfer to the tax authority. Moj-eRačun answers with the tax authority's word at once (a refusal is thrown); ePoslovanje queues the report and the answer comes later in `status()`'s `payment` |
 | `ping(): void` | Tests the connection, and on ePoslovanje that the account fiscalizes its outgoing documents itself; throws `EInvoiceUnavailableException` when the service itself is down |
@@ -225,10 +225,14 @@ For the other kinds of documents:
 - **A credit note** is a `CreditNote` document: call `document(creditNote: true)`, write `cbc:CreditNoteTypeCode` in
   place of the due date and the invoice type code, and pass `creditNote: true` to `line()`.
 
-An issuer outside the VAT system passes `vatRegistered: false`, gives every line an `E` category with the reason, and is
-named by its OIB under the `FRE` scheme. The Croatian extension is written whenever a category is not standard. A
-Croatian buyer is named by its VAT identifier, `HR` and its OIB, whether or not it is in the VAT system: the rules
-HR-BR-S-1 and HR-BR-E-1 ask for it on every invoice with a line at a standard rate or exempt.
+An issuer outside the VAT system passes `vatRegistered: false`, gives every line an `O` category (`HR:O`, outside the
+scope of VAT) with the reason, as Moj-eRačun's example of an issuer under the `FRE` scheme does, is named by its OIB
+under that scheme, and names its buyer the same way (`customerParty(withVatIdentifier: false)`), as such an invoice
+takes no buyer VAT identifier (BR-O-02). An `O` line carries no rate (BR-O-05), the invoice no other category (BR-O-11),
+and the Croatian extension puts its amount under `OutOfScopeOfVATAmount`. The Croatian extension is written whenever a
+category is not standard. Otherwise a Croatian buyer is named by its VAT identifier, `HR` and its OIB, whether or not it
+is in the VAT system: the rules HR-BR-S-1 and HR-BR-E-1 ask for it on every invoice with a line at a standard rate or
+exempt.
 
 The intermediaries sign the documents, so the signature block is left empty for them.
 
@@ -293,7 +297,8 @@ extension and returns what is wrong, or an empty array.
   the invoice to the tax authority itself (`REPORTED`). The package does not report such an invoice through ePoslovanje
   instead (its `/ereporting/reportdocument`, type `IR`): its test server does not check the registry, so the path could
   not be tried. The refusal comes back as the document's; report the invoice another way.
-- It writes nothing outside the scope of VAT.
+- It writes an invoice outside the scope of VAT only whole, as an issuer outside the VAT system sends one (every line
+  `O`); a line outside its scope beside others within it is not supported.
 
 ## Schemas
 

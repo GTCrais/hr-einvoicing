@@ -13,8 +13,8 @@ use GTCrais\HrEInvoicing\FiscalizationStatus;
  * asked for by name, and for one service when a document is followed up where it went. Every answer speaks the
  * package's own DocumentStatus and FiscalizationStatus, whatever the intermediary's codes. Every method throws a
  * RuntimeException with the reason when the intermediary refuses or cannot be reached; send() throws an
- * EInvoiceRefusedException when the intermediary refused the document itself (its rules broken), which no new try
- * of the same document changes.
+ * EInvoiceRefusedException when the intermediary refused the document itself (its rules broken, or a document of its
+ * number it holds already for the year), which no new try of the same document changes.
  */
 interface EInvoiceGateway
 {

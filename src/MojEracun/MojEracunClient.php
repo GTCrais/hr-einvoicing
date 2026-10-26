@@ -59,6 +59,18 @@ class MojEracunClient implements EInvoiceGateway
 	public function send(string $xml): array
 	{
 		$document = $this->post('/apis/v2/send', ['file' => $xml], refusable: true);
+
+		// A send it will not take for a condition of sending answers 200 without a document: one whose number, issuer,
+		// buyer and year it holds already ("already exists with EID=…", the demo's words of 2026-10-26) is refused, as the
+		// document itself is; any other condition a later try may pass
+		$prerequisites = $this->value($document, 'PrerequisitesValidationFailed');
+
+		if (is_array($prerequisites)) {
+			$reason = 'HTTP 200: ' . (trim(implode(' ', array_map(strval(...), (array) ($this->value($prerequisites, 'Messages') ?? [])))) ?: 'the conditions for sending are not met');
+
+			throw preg_match('/already exists|već postoji/iu', $reason) ? new EInvoiceRefusedException($reason) : new RuntimeException($reason);
+		}
+
 		$electronicId = $this->value($document, 'ElectronicId');
 
 		if (blank($electronicId)) {
@@ -69,14 +81,18 @@ class MojEracunClient implements EInvoiceGateway
 	}
 
 	/**
-	 * Looked up in the outbox from the day before the first try on, by the number the document carries and, when
-	 * given, the day it was issued ("Issued").
+	 * Looked up in the outbox by the number the document carries (its InvoiceNumber filter, an exact match, and with
+	 * the day of issue the year's, InvoiceYear, as Moj-eRačun advised on 2026-10-26), among the documents taken in from
+	 * the day before the first try on, and, when given, issued that day ("Issued").
 	 */
 	public function sentDocument(string $number, DateTimeInterface $since, ?string $issueDate = null): ?array
 	{
 		$documents = $this->post('/apis/v2/queryOutbox', [
 			'from' => CarbonImmutable::instance($since)->subDay()->toDateString(),
 			'to' => CarbonImmutable::now()->addDay()->toDateString(),
+			// Only that number, so the answer is never a page of the outbox the document may be missing from
+			'InvoiceNumber' => $number,
+			...($issueDate !== null ? ['InvoiceYear' => (int) substr($issueDate, 0, 4)] : []),
 		], quietlyMissing: true);
 
 		$document = collect(array_is_list($documents) ? $documents : [$documents])

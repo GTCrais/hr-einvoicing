@@ -14,6 +14,11 @@ function exemption(?string $code, string $reason): array
 	return ['key' => 'E|' . $code . '|' . $reason, 'id' => 'E', 'name' => 'HR:E', 'percent' => 0.0, 'code' => $code, 'reason' => $reason];
 }
 
+function outsideVat(string $reason): array
+{
+	return ['key' => 'O', 'id' => 'O', 'name' => 'HR:O', 'percent' => 0.0, 'code' => null, 'reason' => $reason];
+}
+
 /**
  * An invoice of a clinic in the VAT system to a company: an exempt examination and goods at two standard rates.
  */
@@ -81,12 +86,13 @@ it('writes an invoice the schema takes: the heading, both parties by OIB, VAT by
 	expect(collect(iterator_to_array($xpath->query('//*[not(node())]')))->map->localName->all())->toBe(['SignatureInformation']);
 });
 
-it('names an issuer outside the VAT system by its OIB under the FRE scheme, with every line exempt in the Croatian extension', function () {
+it('writes an issuer outside the VAT system as Moj-eRačun\'s example does: both parties by OIB under the FRE scheme, every line outside the scope of VAT with no rate, its amount out of scope in the Croatian extension', function () {
 	$reason = 'Obveznik nije u sustavu PDV-a';
 	$xml = (new ExampleInvoiceBuilder)->build(exampleInvoice([
 		'vatRegistered' => false,
 		'lines' => [
-			['name' => 'Sistematski pregled', 'quantity' => 1, 'net' => 80.0, 'tax' => 0.0, 'kpd' => '86.22.19', 'category' => exemption(null, $reason)],
+			['name' => 'Sistematski pregled', 'quantity' => 1, 'net' => 80.0, 'tax' => 0.0, 'kpd' => '86.22.19', 'category' => outsideVat($reason)],
+			['name' => 'Krema za sunčanje', 'quantity' => 2, 'net' => 45.0, 'tax' => 0.0, 'kpd' => '20.42.19', 'category' => outsideVat($reason)],
 		],
 	]));
 	$xpath = exampleXpath($xml);
@@ -94,15 +100,27 @@ it('names an issuer outside the VAT system by its OIB under the FRE scheme, with
 	expect(UblSchema::errors($xml))->toBe([])
 		->and($xpath->evaluate('string(//cac:AccountingSupplierParty/cac:Party/cac:PartyTaxScheme/cbc:CompanyID)'))->toBe('12345678903')
 		->and($xpath->evaluate('string(//cac:AccountingSupplierParty/cac:Party/cac:PartyTaxScheme/cac:TaxScheme/cbc:ID)'))->toBe('FRE')
-		->and($xpath->evaluate('string(//hrextac:HRTaxSubtotal/hrextac:HRTaxCategory/cbc:TaxExemptionReason)'))->toBe($reason)
+		// No buyer VAT identifier on an invoice outside the scope of VAT (BR-O-02)
+		->and($xpath->evaluate('string(//cac:AccountingCustomerParty/cac:Party/cac:PartyTaxScheme/cbc:CompanyID)'))->toBe('98765432106')
+		->and($xpath->evaluate('string(//cac:AccountingCustomerParty/cac:Party/cac:PartyTaxScheme/cac:TaxScheme/cbc:ID)'))->toBe('FRE')
+		// One breakdown, O, with its reason; the lines O with no rate (BR-O-05)
+		->and($xpath->evaluate('count(/inv:Invoice/cac:TaxTotal/cac:TaxSubtotal)'))->toBe(1.0)
+		->and($xpath->evaluate('string(/inv:Invoice/cac:TaxTotal/cac:TaxSubtotal/cac:TaxCategory/cbc:ID)'))->toBe('O')
+		->and($xpath->evaluate('string(/inv:Invoice/cac:TaxTotal/cac:TaxSubtotal/cbc:TaxableAmount)'))->toBe('125.00')
+		->and($xpath->evaluate('string(/inv:Invoice/cac:TaxTotal/cac:TaxSubtotal/cac:TaxCategory/cbc:TaxExemptionReason)'))->toBe($reason)
+		->and($xpath->evaluate('count(/inv:Invoice/cac:InvoiceLine/cac:Item/cac:ClassifiedTaxCategory[cbc:ID="O"][cbc:Name="HR:O"])'))->toBe(2.0)
+		->and($xpath->evaluate('count(/inv:Invoice/cac:InvoiceLine/cac:Item/cac:ClassifiedTaxCategory/cbc:Percent)'))->toBe(0.0)
+		->and($xpath->evaluate('string(//hrextac:HRTaxSubtotal/hrextac:HRTaxCategory/cbc:Name)'))->toBe('HR:O')
+		->and($xpath->evaluate('string(//hrextac:HRLegalMonetaryTotal/cbc:TaxExclusiveAmount)'))->toBe('0.00')
+		->and($xpath->evaluate('string(//hrextac:HRLegalMonetaryTotal/hrextac:OutOfScopeOfVATAmount)'))->toBe('125.00')
 		->and($xpath->evaluate('count(//cbc:TaxExemptionReasonCode)'))->toBe(0.0);
 });
 
 it('names a Croatian buyer by its VAT identifier, HR and its OIB, on an invoice at standard rates and on one all exempt', function () {
 	// HR-BR-S-1 and HR-BR-E-1 ask for it whether or not the buyer is in the VAT system; the intermediaries' validators
 	// refuse the invoice without it, or with the OIB under the FRE scheme
-	$exempt = exampleInvoice(['vatRegistered' => false, 'lines' => [
-		['name' => 'Sistematski pregled', 'quantity' => 1, 'net' => 80.0, 'tax' => 0.0, 'kpd' => '86.22.19', 'category' => exemption(null, 'Obveznik nije u sustavu PDV-a')],
+	$exempt = exampleInvoice(['lines' => [
+		['name' => 'Sistematski pregled', 'quantity' => 1, 'net' => 80.0, 'tax' => 0.0, 'kpd' => '86.22.19', 'category' => exemption('VATEX-EU-132-1C', 'Oslobođeno PDV-a: zdravstvena usluga')],
 	]]);
 
 	foreach ([exampleInvoice(), $exempt] as $invoice) {
@@ -115,8 +133,8 @@ it('names a Croatian buyer by its VAT identifier, HR and its OIB, on an invoice 
 
 it('gives lines exempt on different grounds one breakdown naming every ground, each line keeping its own', function () {
 	$health = 'Oslobođeno PDV-a prema čl. 39. Zakona o PDV-u';
-	$outside = 'Nije u sustavu PDV-a prema čl. 90. Zakona o PDV-u';
-	$build = fn (array $lines) => (new ExampleInvoiceBuilder)->build(exampleInvoice(['vatRegistered' => false, 'lines' => $lines]));
+	$outside = 'Oslobođeno PDV-a prema čl. 40. Zakona o PDV-u';
+	$build = fn (array $lines) => (new ExampleInvoiceBuilder)->build(exampleInvoice(['lines' => $lines]));
 
 	$xml = $build([
 		['name' => 'Sistematski pregled', 'quantity' => 1, 'net' => 80.0, 'tax' => 0.0, 'kpd' => '86.22.19', 'category' => exemption('VATEX-EU-132', $health)],

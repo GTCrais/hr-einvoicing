@@ -120,7 +120,37 @@ it('finds a document sent before by its number in the outbox, the latest of that
 	expect($client->sentDocument('455/P1/1', Carbon::parse('2026-10-22 14:48:09', 'UTC')))->toBe(['electronicId' => '3687375', 'status' => DocumentStatus::SENT])
 		->and($client->sentDocument('457/P1/1', Carbon::parse('2026-10-22 14:48:09', 'UTC')))->toBeNull();
 
-	Http::assertSent(fn (Request $request) => $request->url() === 'https://demo.moj-eracun.hr/apis/v2/queryOutbox' && $request['from'] === '2026-10-21' && $request['companyId'] === '12345678903');
+	Http::assertSent(fn (Request $request) => $request->url() === 'https://demo.moj-eracun.hr/apis/v2/queryOutbox' && $request['from'] === '2026-10-21' && $request['companyId'] === '12345678903'
+		&& $request['InvoiceNumber'] === '455/P1/1' && !array_key_exists('InvoiceYear', $request->data()));
+});
+
+it('asks the outbox for the number of the year of its day of issue', function () {
+	Http::fake([
+		'https://demo.moj-eracun.hr/apis/v2/queryOutbox' => Http::response([['ElectronicId' => 3690000, 'DocumentNr' => '7/WEB1/1', 'StatusId' => 40, 'Issued' => '2026-12-30T00:00:00']]),
+	]);
+
+	expect(app(MojEracunClient::class)->sentDocument('7/WEB1/1', Carbon::parse('2026-12-30 09:15:00', 'UTC'), '2026-12-30')['electronicId'])->toBe('3690000');
+
+	Http::assertSent(fn (Request $request) => $request['InvoiceNumber'] === '7/WEB1/1' && $request['InvoiceYear'] === 2026);
+});
+
+it('refuses a document whose number of the year it holds already, the way the demo answered on 2026-10-26, and fails for any other condition of sending', function () {
+	$duplicate = ['PrerequisitesValidationFailed' => ['Value' => 'Uvjeti za slanje dokumenta nisu zadovoljeni: {0}', 'Messages' => [
+		'Uvjeti za slanje dokumenta nisu zadovoljeni: Document with identical internal number=455/P1/1, sender=25038668428, receiver=91134904012, for issue year 2026 already exists with EID=3687370.. Trace ID: 36608fe2-8f93-4e39-adbb-1d052aa20c2a.',
+	]]];
+	Http::fake([
+		'https://demo.moj-eracun.hr/apis/v2/send' => Http::sequence()
+			->push($duplicate)
+			->push(['PrerequisitesValidationFailed' => ['Value' => 'Uvjeti za slanje dokumenta nisu zadovoljeni: {0}', 'Messages' => ['Uvjeti za slanje dokumenta nisu zadovoljeni: paket je istekao.']]]),
+	]);
+
+	expect(fn () => app(MojEracunClient::class)->send('<Invoice/>'))->toThrow(EInvoiceRefusedException::class, 'already exists with EID=3687370');
+
+	$exception = rescue(fn () => app(MojEracunClient::class)->send('<Invoice/>'), fn (Throwable $exception) => $exception, false);
+
+	expect($exception)->toBeInstanceOf(RuntimeException::class)
+		->not->toBeInstanceOf(EInvoiceRefusedException::class)
+		->and($exception->getMessage())->toBe('HTTP 200: Uvjeti za slanje dokumenta nisu zadovoljeni: paket je istekao.');
 });
 
 it('tells a number of one year from the same number of the next by the day of issue', function () {

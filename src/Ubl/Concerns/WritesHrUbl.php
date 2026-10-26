@@ -14,9 +14,10 @@ use GTCrais\HrEInvoicing\Ubl\HrUbl;
  * delivery, payment by transfer, the VAT breakdown, the totals and the lines. Elements without text are left out,
  * as the rules forbid empty ones.
  *
- * A VAT category is an array of the id ("S" standard, "E" exempt), the Croatian name ("HR:PDV25", "HR:E"), the
- * percent and the exemption's code and reason (null for a standard rate); categories() groups the lines by id and
- * rate and adds "base" and "tax" to each. A party is an array of its OIB, legal name, street, city, postal code and country.
+ * A VAT category is an array of the id ("S" standard, "E" exempt, "O" outside the scope of VAT, which every line of an
+ * issuer outside the VAT system is), the Croatian name ("HR:PDV25", "HR:E", "HR:O"), the percent and the exemption's
+ * code and reason (null for a standard rate); categories() groups the lines by id and rate and adds "base" and "tax"
+ * to each. A party is an array of its OIB, legal name, street, city, postal code and country.
  */
 trait WritesHrUbl
 {
@@ -116,11 +117,13 @@ trait WritesHrUbl
 	 * legal name. A Croatian buyer's VAT identifier is "HR" and its OIB whether or not it is in the VAT system: the
 	 * Croatian rules HR-BR-S-1 and HR-BR-E-1 ask every invoice with a line at a standard rate or exempt for the buyer's
 	 * VAT identifier (BT-48), and Moj-eRačun's and ePoslovanje's validators refused one without it, or with the OIB under
-	 * the FRE scheme, on 2026-10-26.
+	 * the FRE scheme, on 2026-10-26. An invoice outside the scope of VAT (category O, an issuer outside the VAT system)
+	 * takes none (BR-O-02), so withVatIdentifier false names the buyer by its OIB under the FRE scheme, as Moj-eRačun's
+	 * example of one does.
 	 *
 	 * @param  array{oib: string, name: string, street: ?string, city: ?string, postalCode: ?string, country: string}  $party
 	 */
-	protected function customerParty(DOMElement $root, array $party): void
+	protected function customerParty(DOMElement $root, array $party, bool $withVatIdentifier = true): void
 	{
 		$element = $this->child($this->child($root, 'cac:AccountingCustomerParty'), 'cac:Party');
 
@@ -130,8 +133,8 @@ trait WritesHrUbl
 
 		if ($party['country'] === 'HR') {
 			$scheme = $this->child($element, 'cac:PartyTaxScheme');
-			$this->leaf($scheme, 'cbc:CompanyID', 'HR' . $party['oib']);
-			$this->leaf($this->child($scheme, 'cac:TaxScheme'), 'cbc:ID', 'VAT');
+			$this->leaf($scheme, 'cbc:CompanyID', $withVatIdentifier ? 'HR' . $party['oib'] : $party['oib']);
+			$this->leaf($this->child($scheme, 'cac:TaxScheme'), 'cbc:ID', $withVatIdentifier ? 'VAT' : 'FRE');
 		}
 
 		$legal = $this->child($element, 'cac:PartyLegalEntity');
@@ -196,7 +199,8 @@ trait WritesHrUbl
 
 	/**
 	 * A line of an invoice or a credit note: its quantity in pieces, its net, the item's name, classification code
-	 * (left out when null) and VAT category, and the unit net price.
+	 * (left out when null) and VAT category, with no rate when it is outside the scope of VAT (BR-O-05), and the unit
+	 * net price.
 	 *
 	 * @param  array{id: int, name: string, quantity: int|float, net: float, unit: float, kpd: ?string, category: array<string, mixed>}  $line
 	 */
@@ -214,7 +218,7 @@ trait WritesHrUbl
 			$this->leaf($this->child($item, 'cac:CommodityClassification'), 'cbc:ItemClassificationCode', $line['kpd'], ['listID' => 'CG']);
 		}
 
-		$this->taxCategory($item, 'cac:ClassifiedTaxCategory', $line['category'], withName: true);
+		$this->taxCategory($item, 'cac:ClassifiedTaxCategory', $line['category'], withName: true, withRate: $line['category']['id'] !== 'O');
 
 		$price = $this->child($element, 'cac:Price');
 		$this->leaf($price, 'cbc:PriceAmount', number_format($line['unit'], 6, '.', ''), ['currencyID' => $currency]);
@@ -264,13 +268,15 @@ trait WritesHrUbl
 	}
 
 	/**
-	 * The Croatian extension: the VAT breakdown by category once more, with the Croatian category names, and the
-	 * total outside the scope of VAT, always zero: the documents written here carry nothing outside its scope.
+	 * The Croatian extension: the VAT breakdown by category once more, with the Croatian category names, and the net
+	 * split into what is within the scope of VAT and what is outside it (category O), as Moj-eRačun's example of an
+	 * invoice outside its scope writes them.
 	 *
 	 * @param  list<array<string, mixed>>  $categories
 	 */
 	protected function hrData(DOMElement $content, array $categories, float $net, float $tax, string $currency): void
 	{
+		$outOfScope = round(array_sum(array_map(fn (array $category) => $category['id'] === 'O' ? (float) $category['base'] : 0.0, $categories)), 2);
 		$data = $this->child($content, 'hrextac:HRFISK20Data');
 		$total = $this->child($data, 'hrextac:HRTaxTotal');
 		$this->amount($total, 'cbc:TaxAmount', $tax, $currency);
@@ -283,17 +289,17 @@ trait WritesHrUbl
 		}
 
 		$legal = $this->child($data, 'hrextac:HRLegalMonetaryTotal');
-		$this->amount($legal, 'cbc:TaxExclusiveAmount', $net, $currency);
-		$this->amount($legal, 'hrextac:OutOfScopeOfVATAmount', 0.0, $currency);
+		$this->amount($legal, 'cbc:TaxExclusiveAmount', round($net - $outOfScope, 2), $currency);
+		$this->amount($legal, 'hrextac:OutOfScopeOfVATAmount', $outOfScope, $currency);
 	}
 
 	/**
 	 * A VAT category as the document, a line or the extension carries it: the code, the Croatian name where asked,
-	 * the rate, and the exemption's code and reason.
+	 * the rate unless left out, and the exemption's code and reason.
 	 *
 	 * @param  array<string, mixed>  $category
 	 */
-	protected function taxCategory(DOMElement $parent, string $name, array $category, bool $withName, string $scheme = 'cac:TaxScheme'): void
+	protected function taxCategory(DOMElement $parent, string $name, array $category, bool $withName, string $scheme = 'cac:TaxScheme', bool $withRate = true): void
 	{
 		$element = $this->child($parent, $name);
 
@@ -303,7 +309,9 @@ trait WritesHrUbl
 			$this->leaf($element, 'cbc:Name', $category['name']);
 		}
 
-		$this->leaf($element, 'cbc:Percent', $this->percent((float) $category['percent']));
+		if ($withRate) {
+			$this->leaf($element, 'cbc:Percent', $this->percent((float) $category['percent']));
+		}
 		$this->leaf($element, 'cbc:TaxExemptionReasonCode', $category['code'] ?? null);
 		$this->leaf($element, 'cbc:TaxExemptionReason', $category['reason'] ?? null);
 		$this->leaf($this->child($element, $scheme), 'cbc:ID', 'VAT');
