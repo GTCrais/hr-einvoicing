@@ -61,6 +61,12 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain
 	/** The most listings one lookup reads before it gives up rather than run on (a million documents) */
 	protected const int MAX_PAGES = 1000;
 
+	/**
+	 * The longest one lookup reads listings, after which it gives up as it does past MAX_PAGES: an app holds a lock while
+	 * it looks a document up and then sends it, which must outlast both
+	 */
+	public const int LOOKUP_SECONDS = 60;
+
 	/** The caller's own words, which no other word in the answer outweighs: the caller not recognized, the API key */
 	protected const string CALLER_REFUSAL = '/autentifik|autentik|authentic|unauthori[sz]|api[\s_-]*(?:klju|key)/iu';
 
@@ -105,15 +111,20 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain
 	 * at a time, by the number the document carries and, when given, the day it was issued (`issuedOn`); the newest
 	 * of that number when it was sent more than once. The listing is read to its end, an empty page, as a page shorter
 	 * than asked for may be only the server's own page size; one that answers the same page again, or runs past
-	 * MAX_PAGES, cannot say the document is not there, so the lookup throws rather than answer null.
+	 * MAX_PAGES or LOOKUP_SECONDS, cannot say the document is not there, so the lookup throws rather than answer null.
 	 */
 	public function sentDocument(string $number, DateTimeInterface $since, ?string $issueDate = null): ?array
 	{
 		$from = CarbonImmutable::instance($since)->subDay()->toIso8601String();
 		$offset = 0;
 		$firstId = null;
+		$until = CarbonImmutable::now()->addSeconds(self::LOOKUP_SECONDS);
 
 		for ($page = 0; $page < self::MAX_PAGES; $page++) {
+			if ($page > 0 && CarbonImmutable::now()->gte($until)) {
+				throw new RuntimeException('The intermediary\'s list of outgoing documents could not be read through in ' . self::LOOKUP_SECONDS . ' seconds, so it cannot tell whether it holds document ' . $number . '.');
+			}
+
 			$documents = $this->call('get', '/api/v2/document/outgoing', ['insertedFrom' => $from, 'limit' => self::PAGE_SIZE, 'offset' => $offset]);
 			$documents = array_values(array_filter(array_is_list($documents) ? $documents : [$documents], 'is_array'));
 

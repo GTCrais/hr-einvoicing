@@ -22,7 +22,9 @@ it('keeps what was sent and reported, and answers with the standing a test set a
 	expect($sent)->toBe(['electronicId' => '1001', 'status' => DocumentStatus::SENT])
 		->and($gateway->sent)->toHaveCount(1)
 		->and($gateway->status('1001'))->toBe(['status' => DocumentStatus::DELIVERED, 'fiscalization' => FiscalizationStatus::FAILED, 'error' => 'S005 Poruka nije u skladu s XML shemom', 'payment' => FiscalizationStatus::FISCALIZED, 'paymentError' => null, 'answersError' => null])
-		->and($gateway->status('1002'))->toBe(['status' => DocumentStatus::SENT, 'fiscalization' => null, 'error' => null, 'payment' => null, 'paymentError' => null, 'answersError' => null])
+		// One it never sent, nor was given a standing for, it does not know, as the real ones
+		->and(fn () => $gateway->status('1002'))->toThrow(RuntimeException::class, 'The intermediary does not know the document 1002.')
+		->and(fn () => $gateway->reportPayment('1002', '2026-10-22', 10.0))->toThrow(RuntimeException::class, 'The intermediary does not know the document 1002.')
 		->and($gateway->payments)->toBe([['electronicId' => '1001', 'paidOn' => '2026-10-22', 'amount' => 125.0, 'intermediary' => null, 'environment' => null]])
 		->and($gateway->pings)->toBe(1);
 
@@ -115,6 +117,7 @@ it('stands in, switched on, for the intermediary the gateway names, as that inte
 
 it('records which intermediary and service each call was made through, whichever was handed out last', function () {
 	$manager = fakeWithAccounts(mojEracunEnvironment: 'production');
+	config(['hrEInvoicing.allowProductionAnywhere' => true]);
 	$fake = $manager->fake();
 
 	$ePoslovanje = $manager->driver('eposlovanje', 'demo');
@@ -146,9 +149,33 @@ it('finds a document only through the intermediary and the service it was sent t
 		->and($fake->payments)->toBe([]);
 
 	// Held to the production server, with an account there, it knows nothing of a document on the test server
-	config(['hrEInvoicing.ePoslovanje.environment' => 'production']);
+	config(['hrEInvoicing.ePoslovanje.environment' => 'production', 'hrEInvoicing.allowProductionAnywhere' => true]);
 
 	expect(fn () => $manager->driver('eposlovanje', 'production')->status($sent['electronicId']))->toThrow(RuntimeException::class, 'The intermediary does not know the document 1001.');
+});
+
+it('refuses the production service outside a production installation, every call without an account, and itself in production', function () {
+	$manager = fakeWithAccounts(mojEracunEnvironment: 'production');
+
+	expect(fn () => $manager->driver('mojeracun')->send('<Invoice/>'))->toThrow(RuntimeException::class, 'The intermediary\'s production service is refused outside a production installation.')
+		->and($manager->fake()->sent)->toBe([]);
+
+	// Told it has no account, it refuses every call, as the real client does
+	$fake = $manager->fake();
+	$fake->ready = false;
+
+	expect(fn () => $manager->driver('eposlovanje')->send('<Invoice/>'))->toThrow(RuntimeException::class, 'The intermediary account is not set up.')
+		->and(fn () => $fake->ping())->toThrow(RuntimeException::class, 'The intermediary account is not set up.');
+
+	$fake->ready = true;
+
+	// A stray "fake" in a production installation would mark documents sent that never left
+	app()['env'] = 'production';
+
+	expect(fn () => app(GatewayManager::class)->driver())->toThrow(RuntimeException::class, 'The fake e-invoice gateway is refused in production.')
+		->and(fn () => app(GatewayManager::class)->driver('mojeracun'))->toThrow(RuntimeException::class, 'The fake e-invoice gateway is refused in production.');
+
+	app()['env'] = 'testing';
 });
 
 it('is ready and calls only with an account there, as the real client is', function () {

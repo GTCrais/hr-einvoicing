@@ -93,6 +93,17 @@ it('says which rules a refused document broke, a refusal no new try changes, unl
 		->and($exception->getMessage())->toBe('HTTP 503: Service Unavailable');
 });
 
+it('takes a refusal of the account for one that passes once the account is put right, never for the document refused', function () {
+	Http::fake([
+		'https://demo.moj-eracun.hr/apis/v2/send' => Http::response(['SoftwareId' => ['Value' => 'Test-002', 'Messages' => ['Neispravan SoftwareId.']]], 400),
+	]);
+
+	$exception = rescue(fn () => app(MojEracunClient::class)->send('<Invoice/>'), fn (Throwable $exception) => $exception, false);
+
+	expect($exception)->toBeInstanceOf(RuntimeException::class)
+		->not->toBeInstanceOf(EInvoiceRefusedException::class);
+});
+
 it('finds a document sent before by its number in the outbox, the latest of that number, and nothing for a number it does not hold', function () {
 	Http::fake([
 		'https://demo.moj-eracun.hr/apis/v2/queryOutbox' => Http::sequence()
@@ -160,6 +171,40 @@ it('names a refused, a reported and a delivered document, and says the status na
 	expect($client->status('1'))->toBe(['status' => DocumentStatus::REFUSED, 'fiscalization' => null, 'error' => 'Odbijen', 'payment' => null, 'paymentError' => null, 'answersError' => null])
 		->and($client->status('2')['status'])->toBe(DocumentStatus::REPORTED)
 		->and($client->status('3')['status'])->toBe(DocumentStatus::DELIVERED);
+});
+
+it('stands a document it could not process or deliver by the tax authority\'s answer, so one taken or still being answered is never sent twice', function () {
+	$answer = fn (int $id, int $status) => [['electronicId' => $id, 'messages' => [['status' => $status, 'messageType' => 0, 'dateOfFiscalization' => '2026-10-22T16:48:12+02:00']]]];
+	Http::fake([
+		'https://demo.moj-eracun.hr/apis/v2/queryOutbox' => Http::sequence()
+			->push([['ElectronicId' => 5, 'StatusId' => 50, 'StatusName' => 'Neuspjelo']])
+			->push([['ElectronicId' => 6, 'StatusId' => 50, 'StatusName' => 'Neuspjelo']])
+			->push([['ElectronicId' => 8, 'StatusId' => 50, 'StatusName' => 'Neuspjelo']])
+			->push([['ElectronicId' => 5, 'DocumentNr' => '9/P1/1', 'StatusId' => 50]])
+			->push([['ElectronicId' => 8, 'DocumentNr' => '11/P1/1', 'StatusId' => 50]])
+			->push([['ElectronicId' => 7, 'DocumentNr' => '10/P1/1', 'StatusId' => 50]]),
+		'https://demo.moj-eracun.hr/api/fiscalization/statusOutbox' => Http::sequence()
+			->push($answer(5, 0))
+			->push(['message' => 'Service Unavailable'], 503)
+			->push($answer(8, 2))
+			->push($answer(5, 0))
+			->push($answer(8, 2))
+			->push([], 404),
+	]);
+	$client = app(MojEracunClient::class);
+	$since = Carbon::parse('2026-10-22 14:48:09', 'UTC');
+
+	// The tax authority took it: held, its delivery failed
+	expect($client->status('5'))->toMatchArray(['status' => DocumentStatus::REJECTED, 'fiscalization' => FiscalizationStatus::FISCALIZED, 'error' => 'Neuspjelo'])
+		// Its answers cannot be read, or the tax authority is still answering: followed as sent until they tell
+		->and($client->status('6'))->toMatchArray(['status' => DocumentStatus::SENT, 'answersError' => 'HTTP 503: Service Unavailable'])
+		->and($client->status('8'))->toMatchArray(['status' => DocumentStatus::SENT, 'fiscalization' => FiscalizationStatus::WAITING])
+		// Looked up before sending again: held when the tax authority took it or is still answering, refused when it was
+		// never asked
+		->and($client->sentDocument('9/P1/1', $since))->toBe(['electronicId' => '5', 'status' => DocumentStatus::REJECTED])
+		->and($client->sentDocument('11/P1/1', $since))->toBe(['electronicId' => '8', 'status' => DocumentStatus::SENT])
+		->and($client->sentDocument('10/P1/1', $since))->toBe(['electronicId' => '7', 'status' => DocumentStatus::REFUSED])
+		->and(DocumentStatus::REJECTED->isHeld())->toBeTrue();
 });
 
 it('takes the tax authority answer about the document itself, the latest one, and the one about its payment apart, passing over the answers about other documents', function () {

@@ -11,9 +11,10 @@ use RuntimeException;
  * The run's one FakeEInvoiceGateway as one intermediary on one service, the way GatewayManager hands it out for a name
  * and a service when the configuration says "fake". It can do what the real client of that name can
  * (FakeFiscalizingIntermediary where the client takes fiscalizeAgain()), it is ready and calls only with an account
- * there, from the same account provider and by the same rules as the real client (ChoosesEnvironment), every call is
- * recorded under its name and service, and it finds only the documents sent through that intermediary on that
- * service, as the real one knows nothing of the others. The documents, their standings and what a test told the fake
+ * there, from the same account provider and by the same rules as the real client (ChoosesEnvironment), its
+ * production service refused outside a production installation as the real client's is, every call is recorded under
+ * its name and service, and it finds only the documents sent through that intermediary on that service, as the real
+ * one knows nothing of the others. The documents, their standings and what a test told the fake
  * to do are the shared fake's.
  */
 class FakeIntermediary implements EInvoiceGateway
@@ -72,9 +73,12 @@ class FakeIntermediary implements EInvoiceGateway
 	 */
 	protected function call(callable $call): mixed
 	{
-		if ($this->account() === null) {
+		if (!$this->ready()) {
 			throw new RuntimeException('The intermediary account is not set up.');
 		}
+
+		// The production service is refused outside a production installation, as the real client refuses it
+		$this->serviceFor(['demo' => 'fake', 'production' => 'fake'], $this->account());
 
 		$this->fake->standingInFor($this->intermediary, $this->service());
 

@@ -13,6 +13,7 @@ use GTCrais\HrEInvoicing\Testing\FakeFiscalizingIntermediary;
 use GTCrais\HrEInvoicing\Testing\FakeIntermediary;
 use Illuminate\Contracts\Container\Container;
 use InvalidArgumentException;
+use RuntimeException;
 
 /**
  * Hands out the gateway of an intermediary by name, one instance of each for the whole run: "mojeracun" and
@@ -23,7 +24,7 @@ use InvalidArgumentException;
  * gets it as that intermediary on that service (Testing\FakeIntermediary): able to do what the real client of the name
  * can, set up only where the real client's account provider gives an account, and finding only the documents sent
  * through it, so a test suite that sends through several reads everything off one fake and sees each intermediary as
- * it is.
+ * it is. The fake is refused in a production installation.
  */
 class GatewayManager
 {
@@ -42,6 +43,11 @@ class GatewayManager
 		// The fake answers for every intermediary when the gateway is "fake", or when "fake" is on with the gateway naming
 		// the intermediary a test suite stands in for
 		$faked = config('hrEInvoicing.gateway') === 'fake' || (bool) config('hrEInvoicing.fake', false);
+
+		// A stray "fake" in a production .env would mark documents sent that never left
+		if (($faked || $name === 'fake') && app()->isProduction()) {
+			throw new RuntimeException('The fake e-invoice gateway is refused in production.');
+		}
 
 		if ($faked && blank($name) && $environment === null) {
 			return $this->fake();

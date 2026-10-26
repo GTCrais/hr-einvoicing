@@ -296,7 +296,8 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain
 	 */
 	protected function knowOrRefuse(string $electronicId): void
 	{
-		if (!$this->holds($electronicId)) {
+		// Neither sent nor given a standing by the test, as the real one with an identifier it never gave out
+		if (!isset($this->statuses[$electronicId]) || !$this->holds($electronicId)) {
 			throw new RuntimeException('The intermediary does not know the document ' . $electronicId . '.');
 		}
 	}
@@ -308,6 +309,11 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain
 
 	protected function refuseIfAsked(): void
 	{
+		// Without an account (ready false) every call is refused, as the real client refuses it
+		if (!$this->ready) {
+			throw new RuntimeException('The intermediary account is not set up.');
+		}
+
 		if ($this->failures !== []) {
 			throw array_shift($this->failures);
 		}

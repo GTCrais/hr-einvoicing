@@ -203,6 +203,22 @@ it('gives up on a list of outgoing documents that never ends rather than read on
 		->toThrow(RuntimeException::class, 'runs past 1000 pages');
 });
 
+it('gives up on a list of outgoing documents it cannot read through in its time, so the lock it is looked up under outlasts it', function () {
+	// Every page takes the server twenty seconds
+	Http::fake(['https://test.eposlovanje.hr/api/v2/document/outgoing*' => function (Request $request) {
+		Carbon::setTestNow(Carbon::now()->addSeconds(20));
+
+		return Http::response([['id' => 9000000 - (int) (queryOf($request)['offset'] ?? 0), 'documentId' => 'other/WEB1/1', 'status' => 4]]);
+	}]);
+
+	expect(fn () => app(EPoslovanjeClient::class)->sentDocument('8/WEB1/1', Carbon::parse('2026-10-22 14:48:09', 'UTC')))
+		->toThrow(RuntimeException::class, 'could not be read through in 60 seconds');
+
+	// Three pages read in the minute, the fourth not asked for
+	Http::assertSentCount(3);
+	Carbon::setTestNow();
+});
+
 it('reads the document standing and the tax authority answer off the status answer', function () {
 	$request = fn (array $fields) => ['type' => 1, 'description' => 'Evidencija izlaznog računa', ...$fields];
 	Http::fake([

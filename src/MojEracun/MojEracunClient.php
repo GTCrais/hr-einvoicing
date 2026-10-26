@@ -83,7 +83,21 @@ class MojEracunClient implements EInvoiceGateway
 			->sortByDesc(fn (array $row) => (int) $this->value($row, 'ElectronicId'))
 			->first();
 
-		return $document === null ? null : ['electronicId' => (string) $this->value($document, 'ElectronicId'), 'status' => $this->documentStatus($this->value($document, 'StatusId'))];
+		if ($document === null) {
+			return null;
+		}
+
+		$electronicId = (string) $this->value($document, 'ElectronicId');
+		$status = $this->documentStatus($this->value($document, 'StatusId'));
+
+		// One it could not process or deliver ("Neuspjelo") stands by the tax authority's answer, as status() reads it:
+		// one taken or still being answered is never sent again. Answers that cannot be read throw, and nothing is sent
+		if ($status === DocumentStatus::REFUSED) {
+			[$fiscalization] = $this->latestAnswer($this->taxAuthorityMessages($electronicId), self::FISCALIZATION_MESSAGE_TYPES);
+			$status = $this->failedStatus($fiscalization);
+		}
+
+		return ['electronicId' => $electronicId, 'status' => $status];
 	}
 
 	public function status(string $electronicId): array
@@ -113,6 +127,13 @@ class MojEracunClient implements EInvoiceGateway
 
 		if ($status === DocumentStatus::REFUSED && $error === null) {
 			$error = trim((string) ($this->value($document, 'StatusName') ?? '')) ?: null;
+		}
+
+		// Moj-eRačun's "Neuspjelo" is an error in processing or in delivery, which the tax authority's answer tells apart;
+		// answers that cannot be read leave it followed as sent, to be read again, rather than refused and sent twice or
+		// taken for one the buyer rejected
+		if ($status === DocumentStatus::REFUSED) {
+			$status = $answersError !== null ? DocumentStatus::SENT : $this->failedStatus($fiscalization);
 		}
 
 		return ['status' => $status, 'fiscalization' => $fiscalization, 'error' => $error, 'payment' => $payment, 'paymentError' => $paymentError, 'answersError' => $answersError];
@@ -158,7 +179,22 @@ class MojEracunClient implements EInvoiceGateway
 	}
 
 	/**
-	 * Moj-eRačun's status code of a document as the package's standing.
+	 * Where a document Moj-eRačun could not process or deliver ("Neuspjelo", 50) stands by the tax authority's answer:
+	 * taken, it is held (rejected: its delivery failed); still being answered, it is followed as sent; refused, or never
+	 * asked of the tax authority at all (no answer of any kind), it is refused, to be put right and sent afresh.
+	 */
+	protected function failedStatus(?FiscalizationStatus $fiscalization): DocumentStatus
+	{
+		return match ($fiscalization) {
+			FiscalizationStatus::FISCALIZED => DocumentStatus::REJECTED,
+			FiscalizationStatus::WAITING => DocumentStatus::SENT,
+			default => DocumentStatus::REFUSED,
+		};
+	}
+
+	/**
+	 * Moj-eRačun's status code of a document as the package's standing, before the tax authority's answers are read:
+	 * 50, "Neuspjelo", is refused until they tell otherwise (failedStatus()).
 	 */
 	protected function documentStatus(mixed $statusId): DocumentStatus
 	{
@@ -256,9 +292,9 @@ class MojEracunClient implements EInvoiceGateway
 			return [];
 		}
 
-		// A document it could not take is refused for good; anything else, and any other call it refuses, may pass on a
-		// later try
-		if ($refusable && in_array($response->status(), [400, 422], true)) {
+		// A document it could not take is refused for good; anything else, a refusal of the account included (a wrong
+		// software identifier, a password), and any other call it refuses, may pass on a later try
+		if ($refusable && in_array($response->status(), [400, 422], true) && $this->refusesDocument($response)) {
 			throw new EInvoiceRefusedException($this->failure($response));
 		}
 
@@ -289,6 +325,26 @@ class MojEracunClient implements EInvoiceGateway
 		}
 
 		return null;
+	}
+
+	/**
+	 * Whether a refusal is of the document itself: the rules it broke (Moj-eRačun's "File" messages, a business rule
+	 * of the specification) or the tax authority's code, not a field of the account.
+	 */
+	protected function refusesDocument(Response $response): bool
+	{
+		$json = $response->json();
+
+		if (is_array($json)) {
+			$file = $this->value($json, 'File');
+			$specifics = $this->value($json, 'taxAdministrationSpecifics');
+
+			if ((is_array($file) && (array) ($this->value($file, 'Messages') ?? []) !== []) || (is_array($specifics) && filled($this->value($specifics, 'code')))) {
+				return true;
+			}
+		}
+
+		return (bool) preg_match('/\b(HR-)?BR-[A-Z0-9-]+/', $response->body());
 	}
 
 	/**

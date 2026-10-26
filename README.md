@@ -44,7 +44,7 @@ The service provider is discovered automatically.
 | Variable | Meaning |
 | --- | --- |
 | `HR_EINVOICING_GATEWAY` | `mojeracun` (default), `eposlovanje`, or `fake` for tests |
-| `HR_EINVOICING_FAKE` | `false` (default); `true` has the fake answer for the intermediary the gateway names, as that intermediary |
+| `HR_EINVOICING_FAKE` | `false` (default); `true` has the fake answer for every intermediary, as that intermediary, while the gateway keeps naming yours; never in production, where the fake is refused |
 | `HR_EINVOICING_ALLOW_PRODUCTION_ANYWHERE` | `false` (default): the production services are refused unless the app runs with `APP_ENV=production` |
 | `MOJ_ERACUN_ENVIRONMENT` | `demo` (default) or `production` |
 | `MOJ_ERACUN_USERNAME` | The Moj-eRačun account's username |
@@ -79,9 +79,10 @@ $gateway = app(GatewayManager::class)->driver('eposlovanje');
 try {
     ['electronicId' => $id, 'status' => $status] = $gateway->send($xml);
 } catch (EInvoiceRefusedException $exception) {
-    // The intermediary refused the document itself (the rules it broke); the message says why.
-    // Sending the same document again would be refused again. A refusal of the account (not active,
-    // no funds, an unknown key) is a RuntimeException instead: it passes once the account is put right.
+    // The intermediary refused the document itself (the rules it broke, or the tax authority's code);
+    // the message says why. Sending the same document again would be refused again. A refusal of the
+    // account (not active, no funds, an unknown key, a wrong software identifier) is a RuntimeException
+    // instead: it passes once the account is put right.
 } catch (RuntimeException $exception) {
     // The intermediary could not be reached or answered with an error; a later try may pass.
 }
@@ -104,6 +105,10 @@ authorized the intermediary in the FiskAplikacija).
 `REPORTED` (reported to the tax authority instead, because the buyer takes no e-invoices; Moj-eRačun does this),
 `REFUSED` (the intermediary did not take it; a new try sends it afresh) or `REJECTED` (the intermediary holds it, but it
 will not reach the buyer: the buyer rejected it, or its delivery failed for good; `isHeld()` tells the last two apart).
+Moj-eRačun's "Neuspjelo" (50) is an error in processing or in delivery, which the tax authority's answer tells apart:
+once it fiscalized the document it is `REJECTED`, held, and never sent twice; while the answer is still awaited, or the
+answers cannot be read, it is followed as `SENT`; it is `REFUSED` only when the tax authority refused it or was never
+asked about it.
 `FiscalizationStatus` is `FISCALIZED`, `FAILED` (with the tax authority's code and reason in `error`) or `WAITING`. On
 ePoslovanje a fiscalization counts as taken only when it is marked a success (it marks a refused one completed too), and
 once taken it stays taken whatever a later duplicate request says.
@@ -234,7 +239,8 @@ that intermediary on that service (`Testing\FakeIntermediary`; a name the packag
 the fake), so an app's tests see each intermediary as it is:
 
 - it can do what the real client can: `FiscalizesAgain` only as ePoslovanje (and under the fake's own name);
-- it is ready, and calls, only where the real client's account provider gives an account, by the same rules;
+- it is ready, and calls, only where the real client's account provider gives an account, by the same rules, and its
+  production service is refused outside a production installation, as the real one is;
 - every call is recorded with the intermediary and the service it went to;
 - a document is found only through the intermediary and the service it was sent through; asking another for it finds
   nothing, as the real one knows nothing of it.
@@ -264,6 +270,9 @@ it('sends the invoice', function () {
         ->and(UblSchema::errors($this->gateway->sent[0]))->toBe([]);
 });
 ```
+
+With `ready` false every call is refused as without an account, and `status()`, `reportPayment()` and
+`fiscalizeAgain()` know only the documents sent through it or given a standing with `setStatus()`.
 
 The fake also records `payments`, `pings`, the documents asked to be fiscalized again (`refiscalized`), and every call
 with the intermediary and the service it stood in for (`calls`), so a test can see a document followed up where it went.
