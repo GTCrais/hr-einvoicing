@@ -93,7 +93,7 @@ try {
 | `ready(): bool` | Whether the account is complete |
 | `send(string $xml): array` | Sends the document; returns `electronicId` and its `DocumentStatus` |
 | `sentDocument(string $number, DateTimeInterface $since, ?string $issueDate = null): ?array` | Finds a document sent since then by its number, for a send whose answer was lost; numbers start again every year, so pass the day of issue (`cbc:IssueDate`, Y-m-d) to tell one year's document from the next |
-| `status(string $electronicId): array` | The document's `DocumentStatus`; the tax authority's answer about it, `fiscalization` (a `FiscalizationStatus`, or null while the intermediary has said nothing) with its `error`; and its answer to the latest payment report, `payment` with `paymentError`. The reasons are null where the intermediary gave none. When the standing is known but the tax authority's answers cannot be read (Moj-eRačun reads them with a second call), `answersError` says why and `fiscalization` and `payment` are unknown rather than none; take a null `payment` for a report never made only when `answersError` is null |
+| `status(string $electronicId): array` | The document's `DocumentStatus`; the tax authority's answer about it, `fiscalization` (a `FiscalizationStatus`, or null while the intermediary has said nothing) with its `error`; and its answer to the latest payment report, `payment` with `paymentError`; and `paymentReports`, how many payment reports the intermediary holds of the document (every one it took, those the tax authority refused included), which tells an app that reports more than one payment of a document (one taken back with a negative report, then reported again) whether a report whose answer was lost reached it. The reasons are null where the intermediary gave none. When the standing is known but the tax authority's answers cannot be read (Moj-eRačun reads them with a second call), `answersError` says why and `fiscalization`, `payment` and `paymentReports` are unknown rather than none; take a null `payment` for a report never made only when `answersError` is null |
 | `reportPayment(string $electronicId, string $paidOn, float $amount): void` | Reports a payment by bank transfer to the tax authority. Moj-eRačun answers with the tax authority's word at once (a refusal is thrown); ePoslovanje queues the report and the answer comes later in `status()`'s `payment` |
 | `ping(): void` | Tests the connection, and on ePoslovanje that the account fiscalizes its outgoing documents itself; throws `EInvoiceUnavailableException` when the service itself is down |
 
@@ -226,7 +226,9 @@ For the other kinds of documents:
   place of the due date and the invoice type code, and pass `creditNote: true` to `line()`.
 
 An issuer outside the VAT system passes `vatRegistered: false`, gives every line an `E` category with the reason, and is
-named by its OIB under the `FRE` scheme. The Croatian extension is written whenever a category is not standard.
+named by its OIB under the `FRE` scheme. The Croatian extension is written whenever a category is not standard. A
+Croatian buyer is named by its VAT identifier, `HR` and its OIB, whether or not it is in the VAT system: the rules
+HR-BR-S-1 and HR-BR-E-1 ask for it on every invoice with a line at a standard rate or exempt.
 
 The intermediaries sign the documents, so the signature block is left empty for them.
 
@@ -262,6 +264,7 @@ it('sends the invoice', function () {
     $this->gateway->failNext();        // the next call fails as a timeout would
     $this->gateway->refuseNext();      // the next document is refused
     $this->gateway->loseNextAnswer();  // the next document arrives, but its answer is lost
+    $this->gateway->loseNextPaymentAnswer();  // the next payment report arrives, but its answer is lost
     $this->gateway->setStatus('1001', DocumentStatus::DELIVERED, FiscalizationStatus::FISCALIZED);
 
     // ... send
@@ -276,7 +279,8 @@ With `ready` false every call is refused as without an account, and `status()`, 
 
 The fake also records `payments`, `pings`, the documents asked to be fiscalized again (`refiscalized`), and every call
 with the intermediary and the service it stood in for (`calls`), so a test can see a document followed up where it went.
-`paymentAnswer` is what `status()` tells of a payment once it is reported (fiscalized unless a test says otherwise).
+`paymentAnswer` is what `status()` tells of a payment once it is reported (fiscalized unless a test says otherwise), and
+`paymentReports` counts the reports made through it, unless `setStatus()` names a number.
 
 `UblSchema::errors($xml)` checks a document against the UBL 2.1 Invoice or CreditNote schema with the Croatian
 extension and returns what is wrong, or an empty array.

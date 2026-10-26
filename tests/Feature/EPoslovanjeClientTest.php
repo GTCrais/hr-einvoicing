@@ -270,11 +270,11 @@ it('reads the document standing and the tax authority answer off the status answ
 	]);
 	$client = app(EPoslovanjeClient::class);
 
-	$answer = fn (DocumentStatus $status, ?FiscalizationStatus $fiscalization, ?string $error, ?FiscalizationStatus $payment = null, ?string $paymentError = null) => [...compact('status', 'fiscalization', 'error', 'payment', 'paymentError'), 'answersError' => null];
+	$answer = fn (DocumentStatus $status, ?FiscalizationStatus $fiscalization, ?string $error, ?FiscalizationStatus $payment = null, ?string $paymentError = null, int $paymentReports = 0) => [...compact('status', 'fiscalization', 'error', 'payment', 'paymentError', 'paymentReports'), 'answersError' => null];
 
 	expect($client->status('1'))->toBe($answer(DocumentStatus::DELIVERED, FiscalizationStatus::FISCALIZED, null))
 		// A fiscalization taken stays taken, a refused duplicate after it changes nothing; the payment report is apart
-		->and($client->status('2'))->toBe($answer(DocumentStatus::SENT, FiscalizationStatus::FISCALIZED, null, FiscalizationStatus::FISCALIZED))
+		->and($client->status('2'))->toBe($answer(DocumentStatus::SENT, FiscalizationStatus::FISCALIZED, null, FiscalizationStatus::FISCALIZED, paymentReports: 1))
 		->and($client->status('3'))->toBe($answer(DocumentStatus::SENT, FiscalizationStatus::WAITING, null))
 		->and($client->status('4'))->toBe($answer(DocumentStatus::SENT, null, null))
 		->and($client->status('5'))->toBe($answer(DocumentStatus::REJECTED, FiscalizationStatus::FISCALIZED, 'Odbijen jer iznos nije ispravan'))
@@ -284,7 +284,7 @@ it('reads the document standing and the tax authority answer off the status answ
 		->and($client->status('229872'))->toBe($answer(DocumentStatus::DELIVERED, FiscalizationStatus::FAILED, 'S006 Pristupna točka nije ovlaštena za dostavu podataka'))
 		// No reason given: none made up, the app words it
 		->and($client->status('10'))->toBe($answer(DocumentStatus::DELIVERED, FiscalizationStatus::FAILED, null))
-		->and($client->status('11'))->toBe($answer(DocumentStatus::DELIVERED, FiscalizationStatus::FAILED, 'S006 Pristupna točka nije ovlaštena za dostavu podataka', FiscalizationStatus::FAILED, 'S006 Pristupna točka nije ovlaštena za dostavu podataka'));
+		->and($client->status('11'))->toBe($answer(DocumentStatus::DELIVERED, FiscalizationStatus::FAILED, 'S006 Pristupna točka nije ovlaštena za dostavu podataka', FiscalizationStatus::FAILED, 'S006 Pristupna točka nije ovlaštena za dostavu podataka', 1));
 });
 
 it('reports a payment by bank transfer, and says the reason when the intermediary refuses one', function () {

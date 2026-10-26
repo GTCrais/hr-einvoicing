@@ -144,7 +144,7 @@ it('reads the document standing from the outbox list and leaves the fiscalizatio
 		'https://demo.moj-eracun.hr/api/fiscalization/statusOutbox' => Http::response(['message' => 'Nije moguće pronaći status poruke o fiskalizaciji.', 'traceId' => 'a2fc9bec'], 404),
 	]);
 
-	expect(app(MojEracunClient::class)->status('3687370'))->toBe(['status' => DocumentStatus::SENT, 'fiscalization' => null, 'error' => null, 'payment' => null, 'paymentError' => null, 'answersError' => null]);
+	expect(app(MojEracunClient::class)->status('3687370'))->toBe(['status' => DocumentStatus::SENT, 'fiscalization' => null, 'error' => null, 'payment' => null, 'paymentError' => null, 'paymentReports' => 0, 'answersError' => null]);
 
 	Http::assertSent(fn (Request $request) => $request->url() === 'https://demo.moj-eracun.hr/apis/v2/queryOutbox' && $request['electronicId'] === 3687370);
 });
@@ -155,7 +155,7 @@ it('keeps the standing when the tax authority\'s answers cannot be read and says
 		'https://demo.moj-eracun.hr/api/fiscalization/statusOutbox' => Http::response(['message' => 'Service Unavailable'], 503),
 	]);
 
-	expect(app(MojEracunClient::class)->status('3687370'))->toBe(['status' => DocumentStatus::DELIVERED, 'fiscalization' => null, 'error' => null, 'payment' => null, 'paymentError' => null, 'answersError' => 'HTTP 503: Service Unavailable']);
+	expect(app(MojEracunClient::class)->status('3687370'))->toBe(['status' => DocumentStatus::DELIVERED, 'fiscalization' => null, 'error' => null, 'payment' => null, 'paymentError' => null, 'paymentReports' => null, 'answersError' => 'HTTP 503: Service Unavailable']);
 });
 
 it('names a refused, a reported and a delivered document, and says the status name of a refused one as the reason', function () {
@@ -168,7 +168,7 @@ it('names a refused, a reported and a delivered document, and says the status na
 	]);
 	$client = app(MojEracunClient::class);
 
-	expect($client->status('1'))->toBe(['status' => DocumentStatus::REFUSED, 'fiscalization' => null, 'error' => 'Odbijen', 'payment' => null, 'paymentError' => null, 'answersError' => null])
+	expect($client->status('1'))->toBe(['status' => DocumentStatus::REFUSED, 'fiscalization' => null, 'error' => 'Odbijen', 'payment' => null, 'paymentError' => null, 'paymentReports' => 0, 'answersError' => null])
 		->and($client->status('2')['status'])->toBe(DocumentStatus::REPORTED)
 		->and($client->status('3')['status'])->toBe(DocumentStatus::DELIVERED);
 });
@@ -207,7 +207,21 @@ it('stands a document it could not process or deliver by the tax authority\'s an
 		->and(DocumentStatus::REJECTED->isHeld())->toBeTrue();
 });
 
-it('takes the tax authority answer about the document itself, the latest one, and the one about its payment apart, passing over the answers about other documents', function () {
+it('throws rather than guess when the outbox, or the tax authority\'s answers about a document it could not process, cannot be read, so nothing is sent twice', function () {
+	Http::fake([
+		'https://demo.moj-eracun.hr/apis/v2/queryOutbox' => Http::sequence()
+			->push(['message' => 'Service Unavailable'], 503)
+			->push([['ElectronicId' => 5, 'DocumentNr' => '9/P1/1', 'StatusId' => 50]]),
+		'https://demo.moj-eracun.hr/api/fiscalization/statusOutbox' => Http::response(['message' => 'Service Unavailable'], 503),
+	]);
+	$client = app(MojEracunClient::class);
+	$since = Carbon::parse('2026-10-22 14:48:09', 'UTC');
+
+	expect(fn () => $client->sentDocument('9/P1/1', $since))->toThrow(RuntimeException::class, 'HTTP 503: Service Unavailable')
+		->and(fn () => $client->sentDocument('9/P1/1', $since))->toThrow(RuntimeException::class, 'HTTP 503: Service Unavailable');
+});
+
+it('takes the tax authority answer about the document itself, the latest one, and the one about its payment apart, counting the payment reports, and passes over the answers about other documents', function () {
 	Http::fake([
 		'https://demo.moj-eracun.hr/apis/v2/queryOutbox' => Http::response([['ElectronicId' => 3687370, 'StatusId' => 40]]),
 		'https://demo.moj-eracun.hr/api/fiscalization/statusOutbox' => Http::response([
@@ -223,7 +237,7 @@ it('takes the tax authority answer about the document itself, the latest one, an
 		]),
 	]);
 
-	expect(app(MojEracunClient::class)->status('3687370'))->toBe(['status' => DocumentStatus::DELIVERED, 'fiscalization' => FiscalizationStatus::FAILED, 'error' => 'S005 Poruka nije u skladu s XML shemom', 'payment' => FiscalizationStatus::FAILED, 'paymentError' => 'S007 OIB iz zahtjeva nije formalno ispravan', 'answersError' => null]);
+	expect(app(MojEracunClient::class)->status('3687370'))->toBe(['status' => DocumentStatus::DELIVERED, 'fiscalization' => FiscalizationStatus::FAILED, 'error' => 'S005 Poruka nije u skladu s XML shemom', 'payment' => FiscalizationStatus::FAILED, 'paymentError' => 'S007 OIB iz zahtjeva nije formalno ispravan', 'paymentReports' => 2, 'answersError' => null]);
 });
 
 it('reports a payment with the transfer method, and says the tax authority code when it refuses one', function () {

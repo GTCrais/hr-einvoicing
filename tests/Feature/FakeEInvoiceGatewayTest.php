@@ -21,7 +21,7 @@ it('keeps what was sent and reported, and answers with the standing a test set a
 
 	expect($sent)->toBe(['electronicId' => '1001', 'status' => DocumentStatus::SENT])
 		->and($gateway->sent)->toHaveCount(1)
-		->and($gateway->status('1001'))->toBe(['status' => DocumentStatus::DELIVERED, 'fiscalization' => FiscalizationStatus::FAILED, 'error' => 'S005 Poruka nije u skladu s XML shemom', 'payment' => FiscalizationStatus::FISCALIZED, 'paymentError' => null, 'answersError' => null])
+		->and($gateway->status('1001'))->toBe(['status' => DocumentStatus::DELIVERED, 'fiscalization' => FiscalizationStatus::FAILED, 'error' => 'S005 Poruka nije u skladu s XML shemom', 'payment' => FiscalizationStatus::FISCALIZED, 'paymentError' => null, 'paymentReports' => 1, 'answersError' => null])
 		// One it never sent, nor was given a standing for, it does not know, as the real ones
 		->and(fn () => $gateway->status('1002'))->toThrow(RuntimeException::class, 'The intermediary does not know the document 1002.')
 		->and(fn () => $gateway->reportPayment('1002', '2026-10-22', 10.0))->toThrow(RuntimeException::class, 'The intermediary does not know the document 1002.')
@@ -75,6 +75,31 @@ it('fails, refuses and loses answers when told to, and finds a document whose an
 
 	expect($gateway->sent)->toBe([])
 		->and($gateway->sendStatus)->toBe(DocumentStatus::SENT);
+});
+
+it('counts the payment reports it holds of each document, one whose answer it lost included, and leaves them unknown while the answers cannot be read', function () {
+	$gateway = new FakeEInvoiceGateway;
+	$first = $gateway->send('<Invoice><cbc:ID>1/P1/1</cbc:ID></Invoice>')['electronicId'];
+	$second = $gateway->send('<Invoice><cbc:ID>2/P1/1</cbc:ID></Invoice>')['electronicId'];
+
+	$gateway->reportPayment($first, '2026-10-22', 125.0);
+	$gateway->loseNextPaymentAnswer();
+
+	expect(fn () => $gateway->reportPayment($first, '2026-10-22', -125.0))->toThrow(RuntimeException::class, 'Operation timed out')
+		->and($gateway->status($first)['paymentReports'])->toBe(2)
+		->and($gateway->status($second)['paymentReports'])->toBe(0)
+		->and(array_column($gateway->payments, 'amount'))->toBe([125.0, -125.0]);
+
+	// A standing set later keeps the count, unless it names one
+	$gateway->setStatus($first, DocumentStatus::DELIVERED, FiscalizationStatus::FISCALIZED);
+	$gateway->setStatus($second, DocumentStatus::DELIVERED, paymentReports: 3);
+
+	expect($gateway->status($first)['paymentReports'])->toBe(2)
+		->and($gateway->status($second)['paymentReports'])->toBe(3);
+
+	$gateway->setStatus($first, DocumentStatus::DELIVERED, answersError: 'HTTP 503: Service Unavailable');
+
+	expect($gateway->status($first)['paymentReports'])->toBeNull();
 });
 
 /**

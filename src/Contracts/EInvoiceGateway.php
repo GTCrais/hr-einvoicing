@@ -44,12 +44,15 @@ interface EInvoiceGateway
 	 * Where a sent e-invoice stands with the intermediary and with the tax authority (null while the intermediary has
 	 * said nothing about its fiscalization), with the reason when either refused it; and the tax authority's answer to
 	 * the latest report of its payment (payment: null while the intermediary knows of no report of it; waiting while
-	 * one it took is unanswered), with the reason when it refused it. The reasons are null where the intermediary gave
-	 * none. When the standing is known but the tax authority's answers could not be read, answersError says why, and
-	 * fiscalization and payment are then unknown rather than none: a caller never takes a null payment for a report
-	 * never made unless answersError is null.
+	 * one it took is unanswered), with the reason when it refused it, and how many reports of its payment the
+	 * intermediary holds (paymentReports: every one it took, those the tax authority refused included), which tells a
+	 * caller that reports more than one payment of a document (a payment taken back with a negative one, then reported
+	 * again) whether a report whose answer was lost reached it. The reasons are null where the intermediary gave none.
+	 * When the standing is known but the tax authority's answers could not be read, answersError says why, and
+	 * fiscalization, payment and paymentReports are then unknown rather than none: a caller never takes a null payment
+	 * for a report never made unless answersError is null.
 	 *
-	 * @return array{status: DocumentStatus, fiscalization: ?FiscalizationStatus, error: ?string, payment: ?FiscalizationStatus, paymentError: ?string, answersError: ?string}
+	 * @return array{status: DocumentStatus, fiscalization: ?FiscalizationStatus, error: ?string, payment: ?FiscalizationStatus, paymentError: ?string, paymentReports: ?int, answersError: ?string}
 	 */
 	public function status(string $electronicId): array;
 

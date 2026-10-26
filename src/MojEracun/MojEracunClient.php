@@ -22,8 +22,10 @@ use RuntimeException;
  * one and the software identifier), the document goes as the XML text of a JSON request, and the answers come back
  * as JSON whose keys are written now with a capital and now without, so they are read either way. A query answers
  * with a list; the tax authority's answers about an e-invoice come as a list of documents, each with its messages,
- * and as a 404 while there are none yet. Moj-eRačun's status codes (20 taken in, 30 sent, 40 delivered, 50 refused,
- * 70 reported to the tax authority because the buyer takes no e-invoices) become the package's DocumentStatus. The
+ * and as a 404 while there are none yet. Moj-eRačun's status codes (20 taken in, 30 sent, 40 delivered, 50 not
+ * processed or not delivered, which stands by the tax authority's answer: rejected once it took the document, sent
+ * while it is still answering, refused otherwise; 70 reported to the tax authority because the buyer takes no
+ * e-invoices) become the package's DocumentStatus. The
  * environment is "demo" or "production", the account's own when it names one, and a call may take attemptSeconds;
  * the service provider builds it from config('hrEInvoicing').
  */
@@ -125,6 +127,11 @@ class MojEracunClient implements EInvoiceGateway
 		[$fiscalization, $error] = $this->latestAnswer($messages, self::FISCALIZATION_MESSAGE_TYPES);
 		[$payment, $paymentError] = $this->latestAnswer($messages, [self::PAYMENT_MESSAGE_TYPE]);
 
+		// Every payment report it took has a message of its own, answered or not
+		$paymentReports = $answersError === null
+			? collect($messages)->filter(fn (array $message) => (int) $this->value($message, 'messageType') === self::PAYMENT_MESSAGE_TYPE)->count()
+			: null;
+
 		if ($status === DocumentStatus::REFUSED && $error === null) {
 			$error = trim((string) ($this->value($document, 'StatusName') ?? '')) ?: null;
 		}
@@ -136,7 +143,7 @@ class MojEracunClient implements EInvoiceGateway
 			$status = $answersError !== null ? DocumentStatus::SENT : $this->failedStatus($fiscalization);
 		}
 
-		return ['status' => $status, 'fiscalization' => $fiscalization, 'error' => $error, 'payment' => $payment, 'paymentError' => $paymentError, 'answersError' => $answersError];
+		return ['status' => $status, 'fiscalization' => $fiscalization, 'error' => $error, 'payment' => $payment, 'paymentError' => $paymentError, 'paymentReports' => $paymentReports, 'answersError' => $answersError];
 	}
 
 	public function reportPayment(string $electronicId, string $paidOn, float $amount): void

@@ -171,7 +171,12 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain
 			$error = $this->rejectionReason($document);
 		}
 
-		return ['status' => $status, 'fiscalization' => $fiscalization, 'error' => $error, 'payment' => $payment, 'paymentError' => $paymentError, 'answersError' => null];
+		// Every payment report it took is an eReporting request of its own, answered or not
+		$paymentReports = collect((array) ($document['eReportingRequests'] ?? []))
+			->filter(fn ($request) => is_array($request) && (int) ($request['type'] ?? 0) === self::PAYMENT_REQUEST)
+			->count();
+
+		return ['status' => $status, 'fiscalization' => $fiscalization, 'error' => $error, 'payment' => $payment, 'paymentError' => $paymentError, 'paymentReports' => $paymentReports, 'answersError' => null];
 	}
 
 	public function reportPayment(string $electronicId, string $paidOn, float $amount): void

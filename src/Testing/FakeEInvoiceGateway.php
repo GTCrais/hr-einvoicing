@@ -14,8 +14,9 @@ use RuntimeException;
 
 /**
  * Answers in place of the intermediary: an identifier for every e-invoice sent, the standing a test set for it, and a
- * record of the payments reported, with the tax authority's answer to them; told to refuse the next few calls, it
- * does, and told to lose the next answer, it keeps the document and fails as a timeout would. When
+ * record of the payments reported, with the tax authority's answer to them and how many it holds of each document;
+ * told to refuse the next few calls, it does, and told to lose the next answer, it keeps the document (or the payment
+ * report) and fails as a timeout would. When
  * config('hrEInvoicing.gateway') is "fake" it is the gateway, one for the whole run, and GatewayManager hands it out
  * for every intermediary and service as a FakeIntermediary, which can do what that intermediary's real client can,
  * needs an account there as the client does, and makes its calls through this fake as that intermediary on that
@@ -42,7 +43,7 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain
 
 	public bool $ready = true;
 
-	/** @var array<string, array{status: DocumentStatus, fiscalization: ?FiscalizationStatus, error: ?string, payment: ?FiscalizationStatus, paymentError: ?string}> */
+	/** @var array<string, array{status: DocumentStatus, fiscalization: ?FiscalizationStatus, error: ?string, payment: ?FiscalizationStatus, paymentError: ?string, paymentReports: int, answersError: ?string}> */
 	public array $statuses = [];
 
 	/** The standing a freshly sent document gets */
@@ -53,6 +54,9 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain
 
 	/** Sends whose document is kept but whose answer never comes back */
 	public int $answersToLose = 0;
+
+	/** Payment reports kept but whose answer never comes back */
+	public int $paymentAnswersToLose = 0;
 
 	/** @var list<RuntimeException> */
 	protected array $failures = [];
@@ -87,6 +91,7 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain
 		$this->sendStatus = DocumentStatus::SENT;
 		$this->paymentAnswer = FiscalizationStatus::FISCALIZED;
 		$this->answersToLose = 0;
+		$this->paymentAnswersToLose = 0;
 		$this->failures = [];
 		$this->intermediary = null;
 		$this->environment = null;
@@ -139,12 +144,24 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain
 	}
 
 	/**
-	 * What the intermediary will answer for a document from now on; with answersError, the standing alone, the tax
-	 * authority's answers not read.
+	 * Keep the next payment report, but fail the call as a timeout would, as if the answer were lost on the way back.
 	 */
-	public function setStatus(string $electronicId, DocumentStatus $status, ?FiscalizationStatus $fiscalization = null, ?string $error = null, ?FiscalizationStatus $payment = null, ?string $paymentError = null, ?string $answersError = null): void
+	public function loseNextPaymentAnswer(): void
 	{
-		$this->statuses[$electronicId] = ['status' => $status, 'fiscalization' => $fiscalization, 'error' => $error, 'payment' => $payment, 'paymentError' => $paymentError, 'answersError' => $answersError];
+		$this->paymentAnswersToLose++;
+	}
+
+	/**
+	 * What the intermediary will answer for a document from now on; with answersError, the standing alone, the tax
+	 * authority's answers not read. The payment reports it holds stay as many as were reported through it, unless a
+	 * number is given.
+	 */
+	public function setStatus(string $electronicId, DocumentStatus $status, ?FiscalizationStatus $fiscalization = null, ?string $error = null, ?FiscalizationStatus $payment = null, ?string $paymentError = null, ?string $answersError = null, ?int $paymentReports = null): void
+	{
+		$this->statuses[$electronicId] = [
+			'status' => $status, 'fiscalization' => $fiscalization, 'error' => $error, 'payment' => $payment, 'paymentError' => $paymentError,
+			'paymentReports' => $paymentReports ?? $this->statuses[$electronicId]['paymentReports'] ?? $this->reportsOf($electronicId), 'answersError' => $answersError,
+		];
 	}
 
 	public function ready(): bool
@@ -162,7 +179,7 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain
 
 		$electronicId = (string) (1000 + count($this->sent));
 
-		$this->statuses[$electronicId] = ['status' => $this->sendStatus, 'fiscalization' => null, 'error' => null, 'payment' => null, 'paymentError' => null, 'answersError' => null];
+		$this->statuses[$electronicId] = ['status' => $this->sendStatus, 'fiscalization' => null, 'error' => null, 'payment' => null, 'paymentError' => null, 'paymentReports' => 0, 'answersError' => null];
 
 		if ($this->intermediary !== null) {
 			$this->sentThrough[$electronicId] = ['intermediary' => $this->intermediary, 'environment' => $this->environment];
@@ -210,7 +227,13 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain
 		$this->refuseIfAsked();
 		$this->knowOrRefuse($electronicId);
 
-		return $this->statuses[$electronicId] ?? ['status' => DocumentStatus::SENT, 'fiscalization' => null, 'error' => null, 'payment' => null, 'paymentError' => null, 'answersError' => null];
+		$answer = $this->statuses[$electronicId];
+
+		// Answers that cannot be read leave the reports held unknown, as the real clients do
+		return [
+			'status' => $answer['status'], 'fiscalization' => $answer['fiscalization'], 'error' => $answer['error'], 'payment' => $answer['payment'], 'paymentError' => $answer['paymentError'],
+			'paymentReports' => $answer['answersError'] === null ? $answer['paymentReports'] : null, 'answersError' => $answer['answersError'],
+		];
 	}
 
 	public function reportPayment(string $electronicId, string $paidOn, float $amount): void
@@ -224,6 +247,13 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain
 		if (isset($this->statuses[$electronicId])) {
 			$this->statuses[$electronicId]['payment'] = $this->paymentAnswer;
 			$this->statuses[$electronicId]['paymentError'] = null;
+			$this->statuses[$electronicId]['paymentReports']++;
+		}
+
+		if ($this->paymentAnswersToLose > 0) {
+			$this->paymentAnswersToLose--;
+
+			throw new RuntimeException('cURL error 28: Operation timed out after 15001 milliseconds');
 		}
 	}
 
@@ -247,6 +277,14 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain
 		$this->refuseIfAsked();
 
 		$this->pings++;
+	}
+
+	/**
+	 * How many payments of the document were reported through the fake.
+	 */
+	protected function reportsOf(string $electronicId): int
+	{
+		return count(array_filter($this->payments, fn (array $payment) => $payment['electronicId'] === $electronicId));
 	}
 
 	/**

@@ -113,7 +113,10 @@ trait WritesHrUbl
 
 	/**
 	 * The buyer: by OIB as the endpoint and the identifier, its seat, its VAT identifier when it is Croatian, and its
-	 * legal name.
+	 * legal name. A Croatian buyer's VAT identifier is "HR" and its OIB whether or not it is in the VAT system: the
+	 * Croatian rules HR-BR-S-1 and HR-BR-E-1 ask every invoice with a line at a standard rate or exempt for the buyer's
+	 * VAT identifier (BT-48), and Moj-eRačun's and ePoslovanje's validators refused one without it, or with the OIB under
+	 * the FRE scheme, on 2026-10-26.
 	 *
 	 * @param  array{oib: string, name: string, street: ?string, city: ?string, postalCode: ?string, country: string}  $party
 	 */

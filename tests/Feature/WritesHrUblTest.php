@@ -98,6 +98,21 @@ it('names an issuer outside the VAT system by its OIB under the FRE scheme, with
 		->and($xpath->evaluate('count(//cbc:TaxExemptionReasonCode)'))->toBe(0.0);
 });
 
+it('names a Croatian buyer by its VAT identifier, HR and its OIB, on an invoice at standard rates and on one all exempt', function () {
+	// HR-BR-S-1 and HR-BR-E-1 ask for it whether or not the buyer is in the VAT system; the intermediaries' validators
+	// refuse the invoice without it, or with the OIB under the FRE scheme
+	$exempt = exampleInvoice(['vatRegistered' => false, 'lines' => [
+		['name' => 'Sistematski pregled', 'quantity' => 1, 'net' => 80.0, 'tax' => 0.0, 'kpd' => '86.22.19', 'category' => exemption(null, 'Obveznik nije u sustavu PDV-a')],
+	]]);
+
+	foreach ([exampleInvoice(), $exempt] as $invoice) {
+		$xpath = exampleXpath((new ExampleInvoiceBuilder)->build($invoice));
+
+		expect($xpath->evaluate('string(//cac:AccountingCustomerParty/cac:Party/cac:PartyTaxScheme/cbc:CompanyID)'))->toBe('HR98765432106')
+			->and($xpath->evaluate('string(//cac:AccountingCustomerParty/cac:Party/cac:PartyTaxScheme/cac:TaxScheme/cbc:ID)'))->toBe('VAT');
+	}
+});
+
 it('gives lines exempt on different grounds one breakdown naming every ground, each line keeping its own', function () {
 	$health = 'Oslobođeno PDV-a prema čl. 39. Zakona o PDV-u';
 	$outside = 'Nije u sustavu PDV-a prema čl. 90. Zakona o PDV-u';
