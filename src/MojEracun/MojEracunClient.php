@@ -23,11 +23,10 @@ use RuntimeException;
  * as JSON whose keys are written now with a capital and now without, so they are read either way. A query answers
  * with a list; the tax authority's answers about an e-invoice come as a list of documents, each with its messages,
  * and as a 404 while there are none yet. Moj-eRačun's status codes (20 taken in, 30 sent, 40 delivered, 50 not
- * processed or not delivered, which stands by the tax authority's answer: rejected once it took the document, sent
- * while it is still answering, refused otherwise; 70 reported to the tax authority because the buyer takes no
- * e-invoices) become the package's DocumentStatus. The
- * environment is "demo" or "production", the account's own when it names one, and a call may take attemptSeconds;
- * the service provider builds it from config('hrEInvoicing').
+ * processed or not delivered, which is refused and final: the document was never exchanged, so the tax authority never
+ * saw it and never will, as Moj-eRačun confirmed on 2026-10-27; 70 reported to the tax authority because the buyer
+ * takes no e-invoices) become the package's DocumentStatus. The environment is "demo" or "production", the account's
+ * own when it names one, and a call may take attemptSeconds; the service provider builds it from config('hrEInvoicing').
  */
 class MojEracunClient implements EInvoiceGateway
 {
@@ -105,17 +104,10 @@ class MojEracunClient implements EInvoiceGateway
 			return null;
 		}
 
-		$electronicId = (string) $this->value($document, 'ElectronicId');
-		$status = $this->documentStatus($this->value($document, 'StatusId'));
-
-		// One it could not process or deliver ("Neuspjelo") stands by the tax authority's answer, as status() reads it:
-		// one taken or still being answered is never sent again. Answers that cannot be read throw, and nothing is sent
-		if ($status === DocumentStatus::REFUSED) {
-			[$fiscalization] = $this->latestAnswer($this->taxAuthorityMessages($electronicId), self::FISCALIZATION_MESSAGE_TYPES);
-			$status = $this->failedStatus($fiscalization);
-		}
-
-		return ['electronicId' => $electronicId, 'status' => $status];
+		// One it could not process or deliver ("Neuspjelo", 50) is refused, and final: the caller sends the corrected
+		// document afresh under the same number, which Moj-eRačun's duplicate check allows for a document in 50 alone
+		// (Moj-eRačun, 2026-10-27); the package never writes a CopyIndicator, and one absent says the document is no copy
+		return ['electronicId' => (string) $this->value($document, 'ElectronicId'), 'status' => $this->documentStatus($this->value($document, 'StatusId'))];
 	}
 
 	public function status(string $electronicId): array
@@ -129,6 +121,13 @@ class MojEracunClient implements EInvoiceGateway
 		}
 
 		$status = $this->documentStatus($this->value($document, 'StatusId'));
+
+		// One it could not process or deliver ("Neuspjelo", 50) was never exchanged, so the tax authority never saw it and
+		// never will, no report of it exists, and the standing is final (Moj-eRačun, 2026-10-27); statusOutbox is not asked
+		// about it, as the demo's mock messages would say otherwise
+		if ($status === DocumentStatus::REFUSED) {
+			return ['status' => DocumentStatus::REFUSED, 'fiscalization' => null, 'error' => trim((string) ($this->value($document, 'StatusName') ?? '')) ?: null, 'payment' => null, 'paymentError' => null, 'paymentReports' => 0, 'answersError' => null];
+		}
 
 		// The tax authority's answers come from a call of their own: one that fails leaves the standing known and the
 		// answers unknown (answersError), never read as none
@@ -147,17 +146,6 @@ class MojEracunClient implements EInvoiceGateway
 		$paymentReports = $answersError === null
 			? collect($messages)->filter(fn (array $message) => (int) $this->value($message, 'messageType') === self::PAYMENT_MESSAGE_TYPE)->count()
 			: null;
-
-		if ($status === DocumentStatus::REFUSED && $error === null) {
-			$error = trim((string) ($this->value($document, 'StatusName') ?? '')) ?: null;
-		}
-
-		// Moj-eRačun's "Neuspjelo" is an error in processing or in delivery, which the tax authority's answer tells apart;
-		// answers that cannot be read leave it followed as sent, to be read again, rather than refused and sent twice or
-		// taken for one the buyer rejected
-		if ($status === DocumentStatus::REFUSED) {
-			$status = $answersError !== null ? DocumentStatus::SENT : $this->failedStatus($fiscalization);
-		}
 
 		return ['status' => $status, 'fiscalization' => $fiscalization, 'error' => $error, 'payment' => $payment, 'paymentError' => $paymentError, 'paymentReports' => $paymentReports, 'answersError' => $answersError];
 	}
@@ -202,22 +190,8 @@ class MojEracunClient implements EInvoiceGateway
 	}
 
 	/**
-	 * Where a document Moj-eRačun could not process or deliver ("Neuspjelo", 50) stands by the tax authority's answer:
-	 * taken, it is held (rejected: its delivery failed); still being answered, it is followed as sent; refused, or never
-	 * asked of the tax authority at all (no answer of any kind), it is refused, to be put right and sent afresh.
-	 */
-	protected function failedStatus(?FiscalizationStatus $fiscalization): DocumentStatus
-	{
-		return match ($fiscalization) {
-			FiscalizationStatus::FISCALIZED => DocumentStatus::REJECTED,
-			FiscalizationStatus::WAITING => DocumentStatus::SENT,
-			default => DocumentStatus::REFUSED,
-		};
-	}
-
-	/**
-	 * Moj-eRačun's status code of a document as the package's standing, before the tax authority's answers are read:
-	 * 50, "Neuspjelo", is refused until they tell otherwise (failedStatus()).
+	 * Moj-eRačun's status code of a document as the package's standing: 50, "Neuspjelo", is refused and final, never
+	 * exchanged nor fiscalized, and sent again corrected under its number (Moj-eRačun, 2026-10-27).
 	 */
 	protected function documentStatus(mixed $statusId): DocumentStatus
 	{

@@ -105,10 +105,9 @@ authorized the intermediary in the FiskAplikacija).
 `REPORTED` (reported to the tax authority instead, because the buyer takes no e-invoices; Moj-eRačun does this),
 `REFUSED` (the intermediary did not take it; a new try sends it afresh) or `REJECTED` (the intermediary holds it, but it
 will not reach the buyer: the buyer rejected it, or its delivery failed for good; `isHeld()` tells the last two apart).
-Moj-eRačun's "Neuspjelo" (50) is an error in processing or in delivery, which the tax authority's answer tells apart:
-once it fiscalized the document it is `REJECTED`, held, and never sent twice; while the answer is still awaited, or the
-answers cannot be read, it is followed as `SENT`; it is `REFUSED` only when the tax authority refused it or was never
-asked about it.
+Moj-eRačun's "Neuspjelo" (50) is final: the document was never exchanged, so the tax authority never saw it and never
+will (Moj-eRačun, 2026-10-27). It is `REFUSED`, and the corrected document goes again under the same number, which
+Moj-eRačun's duplicate check allows for a document in 50 alone.
 `FiscalizationStatus` is `FISCALIZED`, `FAILED` (with the tax authority's code and reason in `error`) or `WAITING`. On
 ePoslovanje a fiscalization counts as taken only when it is marked a success (it marks a refused one completed too), and
 once taken it stays taken whatever a later duplicate request says.
