@@ -33,6 +33,13 @@ it('keeps what was sent and reported, and answers with the standing a test set a
 
 	expect($gateway->refiscalized)->toBe(['1001'])
 		->and($gateway->status('1001')['fiscalization'])->toBe(FiscalizationStatus::WAITING);
+
+	// A fiscalization taken stays taken whatever a later request says, as ePoslovanje's standing reads
+	$gateway->setStatus('1001', DocumentStatus::DELIVERED, FiscalizationStatus::FISCALIZED);
+	$gateway->fiscalizeAgain('1001');
+
+	expect($gateway->refiscalized)->toBe(['1001', '1001'])
+		->and($gateway->status('1001')['fiscalization'])->toBe(FiscalizationStatus::FISCALIZED);
 });
 
 it('fails, refuses and loses answers when told to, and finds a document whose answer was lost by its own number only', function () {

@@ -311,6 +311,8 @@ It holds an app to what the real intermediaries do:
 - a standing set with `answersError` answers `fiscalization`, `payment`, their reasons and `paymentReports` as unknown
   (null), as the real clients do; for a `REJECTED` standing the `error` set is its `rejectionReason`, for a failed
   fiscalization its `fiscalizationError`.
+- `fiscalizeAgain()` sets a failed or unanswered fiscalization back to waiting, and leaves a fiscalized one as it is: a
+  fiscalization taken stays taken whatever a later request says, as ePoslovanje's standing reads.
 
 The fake also records `payments`, `pings`, the documents asked to be fiscalized again (`refiscalized`), and every call
 with the intermediary and the service it stood in for (`calls`), so a test can see a document followed up where it went.

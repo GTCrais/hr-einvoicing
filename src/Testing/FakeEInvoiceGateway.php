@@ -309,6 +309,10 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain
 		}
 	}
 
+	/**
+	 * Asked to fiscalize again, it waits for the tax authority's answer once more, unless the document is fiscalized
+	 * already: as ePoslovanje's status() reads it, a fiscalization taken stays taken whatever a later request says.
+	 */
 	public function fiscalizeAgain(string $electronicId): void
 	{
 		$this->record('fiscalizeAgain', $electronicId);
@@ -317,7 +321,7 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain
 
 		$this->refiscalized[] = $electronicId;
 
-		if (isset($this->statuses[$electronicId])) {
+		if (isset($this->statuses[$electronicId]) && $this->statuses[$electronicId]['fiscalization'] !== FiscalizationStatus::FISCALIZED) {
 			$this->statuses[$electronicId]['fiscalization'] = FiscalizationStatus::WAITING;
 			$this->statuses[$electronicId]['error'] = null;
 		}
