@@ -49,11 +49,11 @@ class ExampleInvoiceBuilder
 			$this->billingReference($root, $invoice['refersTo']['number'], $invoice['refersTo']['issueDate']);
 		}
 
-		$this->supplierParty($root, $invoice['supplier'], $invoice['vatRegistered'], $invoice['supplier']['oib'], $invoice['operator']);
+		$this->supplierParty($root, $invoice['supplier'], $invoice['vatRegistered'], $invoice['operatorOib'] ?? $invoice['supplier']['oib'], $invoice['operator']);
 		$this->customerParty($root, $invoice['customer'], withVatIdentifier: $invoice['vatRegistered']);
 
 		if (!$creditNote) {
-			$this->delivery($root, substr($invoice['issuedAt'], 0, 10));
+			$this->delivery($root, $invoice['deliveredOn'] ?? substr($invoice['issuedAt'], 0, 10));
 		}
 
 		$this->paymentMeans($root, $invoice['number'], $invoice['iban']);

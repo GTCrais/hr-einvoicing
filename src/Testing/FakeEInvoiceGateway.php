@@ -15,8 +15,11 @@ use RuntimeException;
 /**
  * Answers in place of the intermediary: an identifier for every e-invoice sent, the standing a test set for it, and a
  * record of the payments reported, with the tax authority's answer to them and how many it holds of each document;
- * told to refuse the next few calls, it does, and told to lose the next answer, it keeps the document (or the payment
- * report) and fails as a timeout would. When
+ * told to fail the next few calls, it does (a refusal of the document only when one is sent, the service down only when
+ * the connection is tested, as the real clients throw them), and told to lose the next answer, it keeps the document
+ * (or the payment report) and fails as a timeout would, and can keep such a document out of the next lookups, as an
+ * intermediary whose lists do not show it yet. Like the real ones, it refuses a document of a number it holds already
+ * for the year, unless the one it holds was refused. When
  * config('hrEInvoicing.gateway') is "fake" it is the gateway, one for the whole run, and GatewayManager hands it out
  * for every intermediary and service as a FakeIntermediary, which can do what that intermediary's real client can,
  * needs an account there as the client does, and makes its calls through this fake as that intermediary on that
@@ -58,8 +61,14 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain
 	/** Payment reports kept but whose answer never comes back */
 	public int $paymentAnswersToLose = 0;
 
-	/** @var list<RuntimeException> */
+	/** The failures a test told it to come, each with the calls it fails (null: any) @var list<array{exception: RuntimeException, methods: ?list<string>}> */
 	protected array $failures = [];
+
+	/** The lookups the next document whose answer is lost is kept out of */
+	protected int $lookupsToHide = 0;
+
+	/** The documents kept out of lookups, with how many more lookups of them they are kept out of, by identifier @var array<string, int> */
+	protected array $hiddenFromLookups = [];
 
 	/** When each document was sent, by its index in sent @var list<CarbonImmutable> */
 	protected array $sentAt = [];
@@ -93,6 +102,8 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain
 		$this->answersToLose = 0;
 		$this->paymentAnswersToLose = 0;
 		$this->failures = [];
+		$this->lookupsToHide = 0;
+		$this->hiddenFromLookups = [];
 		$this->intermediary = null;
 		$this->environment = null;
 	}
@@ -110,29 +121,32 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain
 	}
 
 	/**
-	 * Refuse the next calls with the given error, the way the intermediary does when it is down or rejects a document.
+	 * Fail the next calls, whatever they are, with the given error, the way the intermediary does when it cannot be
+	 * reached or answers with an error.
 	 */
 	public function failNext(int $times = 1, string $error = 'cURL error 28: Connection timed out'): void
 	{
 		for ($i = 0; $i < $times; $i++) {
-			$this->failures[] = new RuntimeException($error);
+			$this->failures[] = ['exception' => new RuntimeException($error), 'methods' => null];
 		}
 	}
 
 	/**
-	 * Refuse the next call's document itself, as the intermediary does with one that breaks its rules.
+	 * Refuse the next document sent, as the intermediary does with one that breaks its rules; only a send is refused so,
+	 * as only the real clients' send() throws it, and a lookup or a status asked before it passes.
 	 */
 	public function refuseNext(string $error = 'HTTP 400: [HR-BR-37] - Račun mora sadržavati oznaku operatera (HR-BT-4)'): void
 	{
-		$this->failures[] = new EInvoiceRefusedException($error);
+		$this->failures[] = ['exception' => new EInvoiceRefusedException($error), 'methods' => ['send']];
 	}
 
 	/**
-	 * Fail the next call as the intermediary does while its service is down, before it looks at the account.
+	 * Fail the next connection test (ping()) as the intermediary does while its service is down, before it looks at the
+	 * account; only the real clients' ping() throws it.
 	 */
 	public function unavailableNext(string $error = 'HTTP 500'): void
 	{
-		$this->failures[] = new EInvoiceUnavailableException($error);
+		$this->failures[] = ['exception' => new EInvoiceUnavailableException($error), 'methods' => ['ping']];
 	}
 
 	/**
@@ -141,6 +155,16 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain
 	public function loseNextAnswer(): void
 	{
 		$this->answersToLose++;
+	}
+
+	/**
+	 * Keep the next document whose answer is lost (loseNextAnswer()) out of the next lookups of it (sentDocument()), as
+	 * an intermediary whose lists do not show a document yet minutes after it took it: a send of it again meanwhile is
+	 * refused for its number, as the real ones refuse it; the lookup after those finds it.
+	 */
+	public function hideFromLookup(int $calls = 1): void
+	{
+		$this->lookupsToHide = max(0, $calls);
 	}
 
 	/**
@@ -172,7 +196,8 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain
 	public function send(string $xml): array
 	{
 		$this->record('send', null);
-		$this->refuseIfAsked();
+		$this->refuseIfAsked('send');
+		$this->refuseDuplicate($xml);
 
 		$this->sent[] = $xml;
 		$this->sentAt[] = CarbonImmutable::now();
@@ -180,6 +205,8 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain
 		$electronicId = (string) (1000 + count($this->sent));
 
 		$this->statuses[$electronicId] = ['status' => $this->sendStatus, 'fiscalization' => null, 'error' => null, 'payment' => null, 'paymentError' => null, 'paymentReports' => 0, 'answersError' => null];
+		// An identifier given out again, after a test emptied sent, is a new document
+		unset($this->hiddenFromLookups[$electronicId]);
 
 		if ($this->intermediary !== null) {
 			$this->sentThrough[$electronicId] = ['intermediary' => $this->intermediary, 'environment' => $this->environment];
@@ -187,6 +214,11 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain
 
 		if ($this->answersToLose > 0) {
 			$this->answersToLose--;
+
+			if ($this->lookupsToHide > 0) {
+				$this->hiddenFromLookups[$electronicId] = $this->lookupsToHide;
+				$this->lookupsToHide = 0;
+			}
 
 			throw new RuntimeException('cURL error 28: Operation timed out after 15001 milliseconds');
 		}
@@ -197,12 +229,12 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain
 	/**
 	 * The newest document sent since the day before the moment whose own number is the given one, as the real
 	 * intermediaries match: not a number it refers to (a storno's or a credit note's billing reference); and, when a day
-	 * of issue is given, issued that day.
+	 * of issue is given, issued that day. One kept out of lookups (hideFromLookup()) is passed over while it is.
 	 */
 	public function sentDocument(string $number, DateTimeInterface $since, ?string $issueDate = null): ?array
 	{
 		$this->record('sentDocument', null);
-		$this->refuseIfAsked();
+		$this->refuseIfAsked('sentDocument');
 
 		$from = CarbonImmutable::instance($since)->subDay();
 
@@ -215,31 +247,51 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain
 				continue;
 			}
 
+			if (($this->hiddenFromLookups[$electronicId] ?? 0) > 0) {
+				$this->hiddenFromLookups[$electronicId]--;
+
+				continue;
+			}
+
 			return ['electronicId' => $electronicId, 'status' => $this->statuses[$electronicId]['status'] ?? DocumentStatus::SENT];
 		}
 
 		return null;
 	}
 
+	/**
+	 * The standing a test set, or the one the document was sent with. The reason in `error` is the rejection's for a
+	 * rejected document (`rejectionReason`), else the tax authority's about its fiscalization (`fiscalizationError`)
+	 * when it failed. With answersError, the tax authority's answers are unknown, as the real clients leave them:
+	 * fiscalization, payment, their reasons and the payment reports held.
+	 */
 	public function status(string $electronicId): array
 	{
 		$this->record('status', $electronicId);
-		$this->refuseIfAsked();
+		$this->refuseIfAsked('status');
 		$this->knowOrRefuse($electronicId);
 
 		$answer = $this->statuses[$electronicId];
+		$rejectionReason = $answer['status'] === DocumentStatus::REJECTED ? $answer['error'] : null;
 
-		// Answers that cannot be read leave the reports held unknown, as the real clients do
+		if ($answer['answersError'] !== null) {
+			return [
+				'status' => $answer['status'], 'fiscalization' => null, 'error' => $rejectionReason, 'payment' => null, 'paymentError' => null, 'paymentReports' => null, 'answersError' => $answer['answersError'],
+				'rejectionReason' => $rejectionReason, 'fiscalizationError' => null,
+			];
+		}
+
 		return [
 			'status' => $answer['status'], 'fiscalization' => $answer['fiscalization'], 'error' => $answer['error'], 'payment' => $answer['payment'], 'paymentError' => $answer['paymentError'],
-			'paymentReports' => $answer['answersError'] === null ? $answer['paymentReports'] : null, 'answersError' => $answer['answersError'],
+			'paymentReports' => $answer['paymentReports'], 'answersError' => null,
+			'rejectionReason' => $rejectionReason, 'fiscalizationError' => $rejectionReason === null && $answer['fiscalization'] === FiscalizationStatus::FAILED ? $answer['error'] : null,
 		];
 	}
 
 	public function reportPayment(string $electronicId, string $paidOn, float $amount): void
 	{
 		$this->record('reportPayment', $electronicId);
-		$this->refuseIfAsked();
+		$this->refuseIfAsked('reportPayment');
 		$this->knowOrRefuse($electronicId);
 
 		$this->payments[] = ['electronicId' => $electronicId, 'paidOn' => $paidOn, 'amount' => $amount, 'intermediary' => $this->intermediary, 'environment' => $this->environment];
@@ -260,7 +312,7 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain
 	public function fiscalizeAgain(string $electronicId): void
 	{
 		$this->record('fiscalizeAgain', $electronicId);
-		$this->refuseIfAsked();
+		$this->refuseIfAsked('fiscalizeAgain');
 		$this->knowOrRefuse($electronicId);
 
 		$this->refiscalized[] = $electronicId;
@@ -274,9 +326,35 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain
 	public function ping(): void
 	{
 		$this->record('ping', null);
-		$this->refuseIfAsked();
+		$this->refuseIfAsked('ping');
 
 		$this->pings++;
+	}
+
+	/**
+	 * Refuse a document of a number the intermediary holds already for the year (the year of its day of issue), as both
+	 * real ones refuse it ("already exists"), unless the one it holds is refused: Moj-eRačun takes the corrected document
+	 * under the number of one it could not process (50). The documents held are those of the intermediary and the
+	 * service the fake stands in for now, as for a lookup.
+	 */
+	protected function refuseDuplicate(string $xml): void
+	{
+		$number = $this->numberOf($xml);
+
+		if ($number === null || $number === '') {
+			return;
+		}
+
+		$year = substr((string) $this->issueDateOf($xml), 0, 4);
+
+		foreach ($this->sent as $index => $held) {
+			$electronicId = (string) (1001 + $index);
+
+			if ($this->numberOf($held) === $number && substr((string) $this->issueDateOf($held), 0, 4) === $year && $this->holds($electronicId)
+				&& ($this->statuses[$electronicId]['status'] ?? DocumentStatus::SENT) !== DocumentStatus::REFUSED) {
+				throw new EInvoiceRefusedException('HTTP 400: Document with identical internal number=' . $number . ($year !== '' ? ', for issue year ' . $year : '') . ' already exists with EID=' . $electronicId . '.');
+			}
+		}
 	}
 
 	/**
@@ -345,15 +423,23 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain
 		$this->calls[] = ['method' => $method, 'electronicId' => $electronicId, 'intermediary' => $this->intermediary, 'environment' => $this->environment];
 	}
 
-	protected function refuseIfAsked(): void
+	/**
+	 * Fail the call as a test told it to: the first failure waiting that this call can meet (a refusal of the document
+	 * only a send, the service down only a connection test, any other failure any call), the others left waiting.
+	 */
+	protected function refuseIfAsked(string $method): void
 	{
 		// Without an account (ready false) every call is refused, as the real client refuses it
 		if (!$this->ready) {
 			throw new RuntimeException('The intermediary account is not set up.');
 		}
 
-		if ($this->failures !== []) {
-			throw array_shift($this->failures);
+		foreach ($this->failures as $index => $failure) {
+			if ($failure['methods'] === null || in_array($method, $failure['methods'], true)) {
+				array_splice($this->failures, $index, 1);
+
+				throw $failure['exception'];
+			}
 		}
 	}
 }

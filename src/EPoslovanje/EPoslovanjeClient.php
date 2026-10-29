@@ -5,6 +5,7 @@ namespace GTCrais\HrEInvoicing\EPoslovanje;
 use Carbon\CarbonImmutable;
 use DateTimeInterface;
 use GTCrais\HrEInvoicing\Concerns\ChoosesEnvironment;
+use GTCrais\HrEInvoicing\Concerns\RedactsSecrets;
 use GTCrais\HrEInvoicing\Contracts\EInvoiceGateway;
 use GTCrais\HrEInvoicing\Contracts\FiscalizesAgain;
 use GTCrais\HrEInvoicing\DocumentStatus;
@@ -12,8 +13,9 @@ use GTCrais\HrEInvoicing\EPoslovanje\Contracts\AccountProvider;
 use GTCrais\HrEInvoicing\Exceptions\EInvoiceRefusedException;
 use GTCrais\HrEInvoicing\Exceptions\EInvoiceUnavailableException;
 use GTCrais\HrEInvoicing\FiscalizationStatus;
-use Illuminate\Http\Client\ConnectionException;
+use Illuminate\Http\Client\HttpClientException;
 use Illuminate\Http\Client\PendingRequest;
+use Illuminate\Http\Client\RequestException;
 use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\Http;
 use RuntimeException;
@@ -24,15 +26,17 @@ use RuntimeException;
  * goes as the XML text of a JSON request with the software identifier, and ePoslovanje validates it, signs it,
  * reports it to the tax authority when the account has outgoing fiscalization switched on, and queues it for the
  * buyer's intermediary. A document's answer names its standing with one of ePoslovanje's codes (1 waiting, 2 being
- * sent, 3 sent, 4 delivered, 5 approved, 6 rejected by the buyer, 7 paid, 8 partly paid, 9 delivery failed) and lists
- * its eReporting requests: the first kind is the document's own fiscalization, the fourth a report of its payment,
- * each answered by the tax authority later (`success`, its `errorCode` and `errorDescription`; a refused request is
- * stamped `completedOn` too). The environment is "demo" (the test server) or "production", and a call may take
- * attemptSeconds; the service provider builds it from config('hrEInvoicing').
+ * sent, 3 sent, 4 delivered, 5 approved, 6 rejected by the buyer, 7 paid, 8 partly paid, 9 delivery failed, which is
+ * read as rejected until ePoslovanje confirms what it means for the document) and lists its eReporting requests: the
+ * first kind is the document's own fiscalization, the fourth a report of its payment, each answered by the tax
+ * authority later (`success`, its `errorCode` and `errorDescription`; a refused request is stamped `completedOn` too).
+ * The environment is "demo" (the test server) or "production", and a call may take attemptSeconds; the service provider
+ * builds it from config('hrEInvoicing'). A failure's message never carries the account's API key.
  */
 class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain
 {
 	use ChoosesEnvironment;
+	use RedactsSecrets;
 
 	/** The intermediary's services by environment */
 	public const array SERVICES = [
@@ -164,19 +168,22 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain
 		}
 
 		$status = $this->documentStatus($document);
-		[$fiscalization, $error] = $this->outcome($document, self::FISCALIZATION_REQUEST, anySuccess: true);
+		[$fiscalization, $fiscalizationError] = $this->outcome($document, self::FISCALIZATION_REQUEST, anySuccess: true);
 		[$payment, $paymentError] = $this->outcome($document, self::PAYMENT_REQUEST, anySuccess: false);
 
-		if ($status === DocumentStatus::REJECTED && $error === null) {
-			$error = $this->rejectionReason($document);
-		}
+		// Why one that will not reach the buyer will not (the buyer's note, or the failed delivery's words) is the reason
+		// an app keeps for it; the tax authority's reason about its fiscalization is kept apart
+		$rejectionReason = $status === DocumentStatus::REJECTED ? $this->rejectionReason($document) : null;
 
 		// Every payment report it took is an eReporting request of its own, answered or not
 		$paymentReports = collect((array) ($document['eReportingRequests'] ?? []))
 			->filter(fn ($request) => is_array($request) && (int) ($request['type'] ?? 0) === self::PAYMENT_REQUEST)
 			->count();
 
-		return ['status' => $status, 'fiscalization' => $fiscalization, 'error' => $error, 'payment' => $payment, 'paymentError' => $paymentError, 'paymentReports' => $paymentReports, 'answersError' => null];
+		return [
+			'status' => $status, 'fiscalization' => $fiscalization, 'error' => $rejectionReason ?? $fiscalizationError, 'payment' => $payment, 'paymentError' => $paymentError, 'paymentReports' => $paymentReports, 'answersError' => null,
+			'rejectionReason' => $rejectionReason, 'fiscalizationError' => $fiscalizationError,
+		];
 	}
 
 	public function reportPayment(string $electronicId, string $paidOn, float $amount): void
@@ -201,10 +208,11 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain
 	{
 		$account = $this->account();
 
+		// No answer, or one cut off on its way, leaves the account untried
 		try {
 			$response = $this->request($account)->get($this->serviceFor(self::SERVICES, $account) . '/api/v2/ping');
-		} catch (ConnectionException $exception) {
-			throw new EInvoiceUnavailableException($exception->getMessage());
+		} catch (HttpClientException $exception) {
+			throw new EInvoiceUnavailableException($this->transportFailure($exception, $account));
 		}
 
 		// A refusal is the account's, an error the service's
@@ -213,7 +221,7 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain
 		}
 
 		if (!$response->successful()) {
-			throw new RuntimeException($this->failure($response));
+			throw new RuntimeException($this->failure($response, $account));
 		}
 
 		$settings = $this->call('get', '/api/v2/account/f2settings', [], $account);
@@ -296,7 +304,8 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain
 	/**
 	 * A JSON call with the account's key; the intermediary's refusal becomes an exception with its message. A send's
 	 * 400 that names the rules the document broke is the document refused for good; any other refusal (the account
-	 * not active, its prepaid funds spent, the key unknown) may pass on a later try, once the account is put right.
+	 * not active, its prepaid funds spent, the key unknown) may pass on a later try, once the account is put right, as
+	 * may a call that got no whole answer (none at all, or one cut off on its way).
 	 *
 	 * @param  array<string, mixed>  $payload
 	 * @param  array<string, mixed>|null  $account
@@ -311,21 +320,45 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain
 			$response = $method === 'get'
 				? $this->request($account)->get($url, $payload)
 				: $this->request($account)->post($url, $payload);
-		} catch (ConnectionException $exception) {
-			throw new RuntimeException($exception->getMessage());
+		} catch (HttpClientException $exception) {
+			throw new RuntimeException($this->transportFailure($exception, $account));
 		}
 
 		if ($refusable && $this->refusesDocument($response)) {
-			throw new EInvoiceRefusedException($this->failure($response));
+			throw new EInvoiceRefusedException($this->failure($response, $account));
 		}
 
 		if (!$response->successful()) {
-			throw new RuntimeException($this->failure($response));
+			throw new RuntimeException($this->failure($response, $account));
 		}
 
 		$json = $response->json();
 
 		return is_array($json) ? $json : [];
+	}
+
+	/**
+	 * Why a call got no whole answer: a RequestException carries what arrived of it (a status, and the body as far as it
+	 * came), read as any other refusal; any other failure says itself. Never with the account's API key.
+	 *
+	 * @param  array<string, mixed>  $account
+	 */
+	protected function transportFailure(HttpClientException $exception, array $account): string
+	{
+		return $exception instanceof RequestException
+			? $this->failure($exception->response, $account)
+			: $this->redact($exception->getMessage(), $this->secrets($account));
+	}
+
+	/**
+	 * What of the account must never be said: its API key.
+	 *
+	 * @param  array<string, mixed>|null  $account
+	 * @return list<mixed>
+	 */
+	protected function secrets(?array $account): array
+	{
+		return [$account['apiKey'] ?? null];
 	}
 
 	/**
@@ -415,12 +448,14 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain
 	}
 
 	/**
-	 * Why the intermediary refused: its error with the details, else the start of the body.
+	 * Why the intermediary refused: its error with the details, else the start of the body; never with the account's
+	 * API key.
+	 *
+	 * @param  array<string, mixed>|null  $account
 	 */
-	protected function failure(Response $response): string
+	protected function failure(Response $response, ?array $account): string
 	{
 		$json = $response->json();
-		$prefix = 'HTTP ' . $response->status() . ': ';
 
 		if (is_array($json)) {
 			$error = trim($this->answerText($json['error'] ?? null));
@@ -428,10 +463,12 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain
 			$message = trim($error . ($details !== '' ? ' (' . $details . ')' : ''));
 
 			if ($message !== '') {
-				return $prefix . $message;
+				return 'HTTP ' . $response->status() . ': ' . $this->redact($message, $this->secrets($account));
 			}
 		}
 
-		return 'HTTP ' . $response->status() . ($response->body() !== '' ? ': ' . mb_substr(trim($response->body()), 0, 300) : '');
+		$excerpt = $this->bodyExcerpt($response->body(), $this->secrets($account));
+
+		return 'HTTP ' . $response->status() . ($excerpt !== '' ? ': ' . $excerpt : '');
 	}
 }

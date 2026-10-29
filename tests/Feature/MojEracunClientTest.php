@@ -4,6 +4,7 @@ use GTCrais\HrEInvoicing\DocumentStatus;
 use GTCrais\HrEInvoicing\Exceptions\EInvoiceRefusedException;
 use GTCrais\HrEInvoicing\Exceptions\EInvoiceUnavailableException;
 use GTCrais\HrEInvoicing\FiscalizationStatus;
+use GTCrais\HrEInvoicing\GatewayManager;
 use GTCrais\HrEInvoicing\MojEracun\Contracts\AccountProvider;
 use GTCrais\HrEInvoicing\MojEracun\MojEracunClient;
 use Illuminate\Http\Client\Request;
@@ -174,7 +175,7 @@ it('reads the document standing from the outbox list and leaves the fiscalizatio
 		'https://demo.moj-eracun.hr/api/fiscalization/statusOutbox' => Http::response(['message' => 'Nije moguće pronaći status poruke o fiskalizaciji.', 'traceId' => 'a2fc9bec'], 404),
 	]);
 
-	expect(app(MojEracunClient::class)->status('3687370'))->toBe(['status' => DocumentStatus::SENT, 'fiscalization' => null, 'error' => null, 'payment' => null, 'paymentError' => null, 'paymentReports' => 0, 'answersError' => null]);
+	expect(app(MojEracunClient::class)->status('3687370'))->toBe(['status' => DocumentStatus::SENT, 'fiscalization' => null, 'error' => null, 'payment' => null, 'paymentError' => null, 'paymentReports' => 0, 'answersError' => null, 'rejectionReason' => null, 'fiscalizationError' => null]);
 
 	Http::assertSent(fn (Request $request) => $request->url() === 'https://demo.moj-eracun.hr/apis/v2/queryOutbox' && $request['electronicId'] === 3687370);
 });
@@ -185,7 +186,7 @@ it('keeps the standing when the tax authority\'s answers cannot be read and says
 		'https://demo.moj-eracun.hr/api/fiscalization/statusOutbox' => Http::response(['message' => 'Service Unavailable'], 503),
 	]);
 
-	expect(app(MojEracunClient::class)->status('3687370'))->toBe(['status' => DocumentStatus::DELIVERED, 'fiscalization' => null, 'error' => null, 'payment' => null, 'paymentError' => null, 'paymentReports' => null, 'answersError' => 'HTTP 503: Service Unavailable']);
+	expect(app(MojEracunClient::class)->status('3687370'))->toBe(['status' => DocumentStatus::DELIVERED, 'fiscalization' => null, 'error' => null, 'payment' => null, 'paymentError' => null, 'paymentReports' => null, 'answersError' => 'HTTP 503: Service Unavailable', 'rejectionReason' => null, 'fiscalizationError' => null]);
 });
 
 it('names a refused, a reported and a delivered document, and says the status name of a refused one as the reason', function () {
@@ -194,11 +195,11 @@ it('names a refused, a reported and a delivered document, and says the status na
 			->push([['ElectronicId' => 1, 'StatusId' => 50, 'StatusName' => 'Odbijen']])
 			->push([['ElectronicId' => 2, 'StatusId' => 70, 'StatusName' => 'Prijavljen']])
 			->push([['ElectronicId' => 3, 'StatusId' => 40, 'StatusName' => 'Dostavljen']]),
-		'https://demo.moj-eracun.hr/api/fiscalization/statusOutbox' => Http::response([], 404),
+		'https://demo.moj-eracun.hr/api/fiscalization/statusOutbox' => Http::response(['message' => 'Nije moguće pronaći status poruke o fiskalizaciji.', 'traceId' => 'a2fc9bec'], 404),
 	]);
 	$client = app(MojEracunClient::class);
 
-	expect($client->status('1'))->toBe(['status' => DocumentStatus::REFUSED, 'fiscalization' => null, 'error' => 'Odbijen', 'payment' => null, 'paymentError' => null, 'paymentReports' => 0, 'answersError' => null])
+	expect($client->status('1'))->toBe(['status' => DocumentStatus::REFUSED, 'fiscalization' => null, 'error' => 'Odbijen', 'payment' => null, 'paymentError' => null, 'paymentReports' => 0, 'answersError' => null, 'rejectionReason' => null, 'fiscalizationError' => null])
 		->and($client->status('2')['status'])->toBe(DocumentStatus::REPORTED)
 		->and($client->status('3')['status'])->toBe(DocumentStatus::DELIVERED);
 
@@ -220,7 +221,7 @@ it('reads a document it could not process or deliver as refused and final, whate
 	]);
 	$client = app(MojEracunClient::class);
 	$since = Carbon::parse('2026-10-22 14:48:09', 'UTC');
-	$refused = ['status' => DocumentStatus::REFUSED, 'fiscalization' => null, 'error' => 'Neuspjelo', 'payment' => null, 'paymentError' => null, 'paymentReports' => 0, 'answersError' => null];
+	$refused = ['status' => DocumentStatus::REFUSED, 'fiscalization' => null, 'error' => 'Neuspjelo', 'payment' => null, 'paymentError' => null, 'paymentReports' => 0, 'answersError' => null, 'rejectionReason' => null, 'fiscalizationError' => null];
 
 	// Never exchanged, so the tax authority never saw it and no report of it exists
 	expect($client->status('5'))->toBe($refused)
@@ -266,7 +267,7 @@ it('takes the tax authority answer about the document itself, the latest one, an
 		]),
 	]);
 
-	expect(app(MojEracunClient::class)->status('3687370'))->toBe(['status' => DocumentStatus::DELIVERED, 'fiscalization' => FiscalizationStatus::FAILED, 'error' => 'S005 Poruka nije u skladu s XML shemom', 'payment' => FiscalizationStatus::FAILED, 'paymentError' => 'S007 OIB iz zahtjeva nije formalno ispravan', 'paymentReports' => 2, 'answersError' => null]);
+	expect(app(MojEracunClient::class)->status('3687370'))->toBe(['status' => DocumentStatus::DELIVERED, 'fiscalization' => FiscalizationStatus::FAILED, 'error' => 'S005 Poruka nije u skladu s XML shemom', 'payment' => FiscalizationStatus::FAILED, 'paymentError' => 'S007 OIB iz zahtjeva nije formalno ispravan', 'paymentReports' => 2, 'answersError' => null, 'rejectionReason' => null, 'fiscalizationError' => 'S005 Poruka nije u skladu s XML shemom']);
 });
 
 it('reports a payment with the transfer method, and says the tax authority code when it refuses one', function () {
@@ -331,4 +332,99 @@ it('is not ready without the software identifier the intermediary issued, and se
 
 	expect($client->ready())->toBeFalse()
 		->and(fn () => $client->send('<Invoice/>'))->toThrow(RuntimeException::class, 'The intermediary account is not set up.');
+});
+
+it('reads a 404 as nothing to tell only when it is Moj-eRačun\'s own answer, and fails for any other, never reading the answers or the outbox as empty', function () {
+	Http::fake([
+		'https://demo.moj-eracun.hr/apis/v2/queryOutbox' => Http::sequence()
+			->push([['ElectronicId' => 3687370, 'StatusId' => 40]])
+			->push([['ElectronicId' => 3687370, 'StatusId' => 40]])
+			->push('<html><body><h1>404 Not Found</h1></body></html>', 404),
+		// A proxy's page, then a route that answers nothing at all
+		'https://demo.moj-eracun.hr/api/fiscalization/statusOutbox' => Http::sequence()
+			->push('<html><body><h1>404 Not Found</h1></body></html>', 404)
+			->push('', 404),
+	]);
+	$client = app(MojEracunClient::class);
+
+	expect($client->status('3687370'))->toMatchArray(['status' => DocumentStatus::DELIVERED, 'payment' => null, 'paymentReports' => null, 'answersError' => 'HTTP 404: <html><body><h1>404 Not Found</h1></body></html>'])
+		->and($client->status('3687370'))->toMatchArray(['paymentReports' => null, 'answersError' => 'HTTP 404'])
+		->and(fn () => $client->sentDocument('455/P1/1', Carbon::now()))->toThrow(RuntimeException::class, 'HTTP 404: <html>');
+});
+
+it('says which fields it refused without the values it repeats, and never says the account\'s password, however the answer carries it', function () {
+	config(['hrEInvoicing.mojEracun.password' => 'ta+jna&č']);
+	Http::fake([
+		'https://demo.moj-eracun.hr/apis/v2/send' => Http::sequence()
+			// Its field errors repeat the value sent with each
+			->push(['Password' => ['Value' => 'ta+jna&č', 'Messages' => ['Neispravna lozinka.']], 'SoftwareId' => ['Value' => 'Test-002', 'Messages' => ['Neispravan SoftwareId.']]], 400)
+			->push(['message' => 'Lozinka ta+jna&č nije ispravna.'], 401)
+			// Cut off, and written as .NET escapes it
+			->push('{"message":"Lozinka ta+jna&č nije isprav', 500),
+	]);
+	$client = app(MojEracunClient::class);
+
+	$messages = array_map(fn () => rescue(fn () => $client->send('<Invoice/>'), fn (Throwable $exception) => $exception->getMessage(), false), range(1, 3));
+
+	expect($messages)->toBe([
+		'HTTP 400: Password: Neispravna lozinka.; SoftwareId: Neispravan SoftwareId.',
+		'HTTP 401: Lozinka [redacted] nije ispravna.',
+		'HTTP 500: {"message":"Lozinka [redacted] nije isprav',
+	]);
+});
+
+it('takes an answer cut off on its way for one that never came: the tax authority\'s answers unknown, no document refused, and the service down when the connection is tested', function () {
+	Http::fake([
+		'https://demo.moj-eracun.hr/apis/v2/queryOutbox' => Http::response([['ElectronicId' => 3687370, 'StatusId' => 40]]),
+		'https://demo.moj-eracun.hr/api/fiscalization/statusOutbox' => answerCutOff(503, '{"message":"Service Unav'),
+		'https://demo.moj-eracun.hr/apis/v2/send' => answerCutOff(400, '{"File":{"Messages":["[HR-BR-37] - Račun mora'),
+		'https://demo.moj-eracun.hr/apis/v2/Ping/' => answerCutOff(502, '<title>502 Bad Gate'),
+	]);
+	$client = app(MojEracunClient::class);
+
+	$sent = rescue(fn () => $client->send('<Invoice/>'), fn (Throwable $exception) => $exception, false);
+
+	expect($sent)->toBeInstanceOf(RuntimeException::class)
+		->not->toBeInstanceOf(EInvoiceRefusedException::class)
+		->and($client->status('3687370'))->toMatchArray(['status' => DocumentStatus::DELIVERED, 'paymentReports' => null, 'answersError' => 'HTTP 503: {"message":"Service Unav'])
+		->and(fn () => $client->ping())->toThrow(EInvoiceUnavailableException::class, 'HTTP 502: <title>502 Bad Gate');
+});
+
+it('follows a document up with a tenant\'s one account only on the service that account is on, and calls nowhere without one', function () {
+	config(['hrEInvoicing.allowProductionAnywhere' => true]);
+	// The README's TenantMojEracunAccount: one account, on the service it names, with none kept per service
+	app()->instance(AccountProvider::class, new class implements AccountProvider
+	{
+		public function account(): ?array
+		{
+			return ['username' => 'klinika', 'password' => 'tajna', 'companyId' => '12345678903', 'companyBU' => null, 'softwareId' => 'Test-002', 'environment' => 'production'];
+		}
+	});
+	Http::fake([
+		'https://www.moj-eracun.hr/apis/v2/queryOutbox' => Http::response([['ElectronicId' => 81, 'StatusId' => 40]]),
+		'https://www.moj-eracun.hr/api/fiscalization/statusOutbox' => Http::response(['message' => 'Nema dokumenata.'], 404),
+	]);
+	$manager = app(GatewayManager::class);
+	$production = $manager->driver('mojeracun', 'production');
+	$demo = $manager->driver('mojeracun', 'demo');
+
+	expect($production->ready())->toBeTrue()
+		->and($production->status('81')['status'])->toBe(DocumentStatus::DELIVERED)
+		->and($demo->ready())->toBeFalse()
+		->and(fn () => $demo->status('81'))->toThrow(RuntimeException::class, 'The intermediary account is not set up.');
+
+	Http::assertSent(fn (Request $request) => $request->url() === 'https://www.moj-eracun.hr/apis/v2/queryOutbox' && $request['username'] === 'klinika');
+	Http::assertNotSent(fn (Request $request) => str_starts_with($request->url(), 'https://demo.moj-eracun.hr/'));
+
+	// An account that names no service is on the one the client is configured for, the demo service here
+	app()->instance(AccountProvider::class, new class implements AccountProvider
+	{
+		public function account(): ?array
+		{
+			return ['username' => 'klinika', 'password' => 'tajna', 'companyId' => '12345678903', 'companyBU' => null, 'softwareId' => 'Test-002'];
+		}
+	});
+
+	expect(app(MojEracunClient::class)->onEnvironment('demo')->ready())->toBeTrue()
+		->and(app(MojEracunClient::class)->onEnvironment('production')->ready())->toBeFalse();
 });

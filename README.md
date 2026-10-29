@@ -93,9 +93,9 @@ try {
 | `ready(): bool` | Whether the account is complete |
 | `send(string $xml): array` | Sends the document; returns `electronicId` and its `DocumentStatus`. A document whose number the intermediary holds already for the year (ePoslovanje's "already exists", Moj-eRačun's "already exists with EID=…") is refused with an `EInvoiceRefusedException`, as a document breaking the rules is; an app that sent it minutes after a try whose answer was lost looks it up instead |
 | `sentDocument(string $number, DateTimeInterface $since, ?string $issueDate = null): ?array` | Finds a document sent since then by its number, for a send whose answer was lost; numbers start again every year, so pass the day of issue (`cbc:IssueDate`, Y-m-d) to tell one year's document from the next. Moj-eRačun is asked for that number of that year alone (its `InvoiceNumber` and `InvoiceYear` filters), so the answer is never a page of the outbox the document may be missing from |
-| `status(string $electronicId): array` | The document's `DocumentStatus`; the tax authority's answer about it, `fiscalization` (a `FiscalizationStatus`, or null while the intermediary has said nothing) with its `error`; and its answer to the latest payment report, `payment` with `paymentError`; and `paymentReports`, how many payment reports the intermediary holds of the document (every one it took, those the tax authority refused included), which tells an app that reports more than one payment of a document (one taken back with a negative report, then reported again) whether a report whose answer was lost reached it. The reasons are null where the intermediary gave none. When the standing is known but the tax authority's answers cannot be read (Moj-eRačun reads them with a second call), `answersError` says why and `fiscalization`, `payment` and `paymentReports` are unknown rather than none; take a null `payment` for a report never made only when `answersError` is null |
+| `status(string $electronicId): array` | The document's `DocumentStatus`; the tax authority's answer about it, `fiscalization` (a `FiscalizationStatus`, or null while the intermediary has said nothing) with its reason in `fiscalizationError`; and its answer to the latest payment report, `payment` with `paymentError`; and `paymentReports`, how many payment reports the intermediary holds of the document (every one it took, those the tax authority refused included), which tells an app that reports more than one payment of a document (one taken back with a negative report, then reported again) whether a report whose answer was lost reached it. `error` is the reason to keep for the standing: for a `REJECTED` document why it will not reach the buyer, when the intermediary says (`rejectionReason`: the buyer's note, or the failed delivery's words), for a `REFUSED` one the intermediary's reason, else the tax authority's (`fiscalizationError`). The reasons are null where the intermediary gave none. When the standing is known but the tax authority's answers cannot be read (Moj-eRačun reads them with a second call), `answersError` says why and `fiscalization`, `payment`, their reasons and `paymentReports` are unknown rather than none; take a null `payment` for a report never made only when `answersError` is null |
 | `reportPayment(string $electronicId, string $paidOn, float $amount): void` | Reports a payment by bank transfer to the tax authority. Moj-eRačun answers with the tax authority's word at once (a refusal is thrown); ePoslovanje queues the report and the answer comes later in `status()`'s `payment` |
-| `ping(): void` | Tests the connection, and on ePoslovanje that the account fiscalizes its outgoing documents itself; throws `EInvoiceUnavailableException` when the service itself is down |
+| `ping(): void` | Tests the connection, and on ePoslovanje that the account fiscalizes its outgoing documents itself; throws `EInvoiceUnavailableException` when the service itself is down (no answer, an answer cut off on its way, or a server error) |
 
 A gateway that also implements `Contracts\FiscalizesAgain` (ePoslovanje, and the fake as ePoslovanje or under its own name) takes `fiscalizeAgain($electronicId)`:
 a new request to the tax authority for a document it refused, once the cause is put right (with S006, the issuer had not
@@ -108,11 +108,19 @@ will not reach the buyer: the buyer rejected it, or its delivery failed for good
 Moj-eRačun's "Neuspjelo" (50) is final: the document was never exchanged, so the tax authority never saw it and never
 will (Moj-eRačun, 2026-10-27). It is `REFUSED`, and the corrected document goes again under the same number, which
 Moj-eRačun's duplicate check allows for a document in 50 alone.
-`FiscalizationStatus` is `FISCALIZED`, `FAILED` (with the tax authority's code and reason in `error`) or `WAITING`. On
+A Moj-eRačun document never becomes `REJECTED` today: the package reads no processing status of the buyer's from
+Moj-eRačun, so a document the buyer rejected stays `DELIVERED`. ePoslovanje's code 9 (delivery failed) is read as
+`REJECTED` until ePoslovanje confirms what it means for the document.
+`FiscalizationStatus` is `FISCALIZED`, `FAILED` (with the tax authority's code and reason in `fiscalizationError`, and in
+`error` unless the document is `REJECTED`) or `WAITING`. On
 ePoslovanje a fiscalization counts as taken only when it is marked a success (it marks a refused one completed too), and
 once taken it stays taken whatever a later duplicate request says.
 
-Every call throws a `RuntimeException` with the reason when it fails.
+Every call throws a `RuntimeException` with the reason when it fails, an answer cut off on its way included. The reason
+never carries the account's password or API key, whatever the intermediary echoed back: a Moj-eRačun answer about the
+fields it refused is read as each field and its messages, without the value it repeats. A 404 from Moj-eRačun counts
+as "nothing yet" (no answer of the tax authority, an empty outbox) only when it is Moj-eRačun's own answer; any other
+404, a proxy's page say, is thrown as a failure.
 
 ### One account per tenant
 
@@ -152,7 +160,8 @@ $this->app->bind(\GTCrais\HrEInvoicing\EPoslovanje\Contracts\AccountProvider::cl
 An ePoslovanje account is `['apiKey' => …, 'oib' => …, 'softwareId' => …]`, with the same optional `environment`.
 
 When a tenant's intermediary or service can change, keep both with every document you send and follow the document up
-where it went: `GatewayManager::driver($name, $environment)` hands out a client held to that service.
+where it went: `GatewayManager::driver($name, $environment)` hands out a client held to that service (a blank one names
+none, and the client follows the account's own service, as `driver($name)` does).
 `GatewayManager::INTERMEDIARIES` lists the names. A provider that keeps an account per service implements
 `Contracts\AccountsByEnvironment` (`accountFor($environment)`), and the held client calls with that service's account;
 the configured providers answer only for the service they are configured for, so a document of the other service has
@@ -235,6 +244,14 @@ exempt.
 
 The intermediaries sign the documents, so the signature block is left empty for them.
 
+Text goes in as XML 1.0 takes it, whatever was typed or pasted: a character XML forbids (a control character, such as
+the line break Word pastes, U+000B) is left out, the vertical tab and the form feed become a space, and bytes that are
+not UTF-8 become `?`, so one stray character in a service's or a buyer's name never makes a document no intermediary can
+read. A value blank once trimmed is no value: its element is left out, and so is a part none of whose elements was
+written (the operator's `SellerContact` without the operator, the `PayeeFinancialAccount` without an IBAN, the
+`Delivery` without its day); `billingReference()` writes nothing without the number. A part you add yourself with
+`child()` is written at once; when it may end up empty, `pruneEmpty($part)` leaves it out.
+
 ## Testing
 
 Set `HR_EINVOICING_GATEWAY=fake` in `phpunit.xml`, or keep the gateway naming your intermediary and set
@@ -265,8 +282,10 @@ beforeEach(function () {
 
 it('sends the invoice', function () {
     $this->gateway->failNext();        // the next call fails as a timeout would
-    $this->gateway->refuseNext();      // the next document is refused
+    $this->gateway->refuseNext();      // the next document sent is refused
+    $this->gateway->unavailableNext(); // the next connection test finds the service down
     $this->gateway->loseNextAnswer();  // the next document arrives, but its answer is lost
+    $this->gateway->hideFromLookup();  // and the next lookup of that document does not find it yet
     $this->gateway->loseNextPaymentAnswer();  // the next payment report arrives, but its answer is lost
     $this->gateway->setStatus('1001', DocumentStatus::DELIVERED, FiscalizationStatus::FISCALIZED);
 
@@ -279,6 +298,19 @@ it('sends the invoice', function () {
 
 With `ready` false every call is refused as without an account, and `status()`, `reportPayment()` and
 `fiscalizeAgain()` know only the documents sent through it or given a standing with `setStatus()`.
+
+It holds an app to what the real intermediaries do:
+
+- a document of a number it holds already for the year (of its `cbc:IssueDate`), through the same intermediary and
+  service, is refused with an `EInvoiceRefusedException`, unless the one it holds is `REFUSED`; so an app that sends a
+  document again without looking it up first fails its tests as it would fail in production;
+- `refuseNext()` refuses only a send and `unavailableNext()` fails only `ping()`, as only those of the real clients throw
+  them, so a lookup or a status asked first passes; `failNext()` fails whatever call comes next;
+- `hideFromLookup($calls)` keeps the next document whose answer is lost out of that many lookups of it (one by default),
+  as an intermediary whose lists do not show a document yet minutes after it took it;
+- a standing set with `answersError` answers `fiscalization`, `payment`, their reasons and `paymentReports` as unknown
+  (null), as the real clients do; for a `REJECTED` standing the `error` set is its `rejectionReason`, for a failed
+  fiscalization its `fiscalizationError`.
 
 The fake also records `payments`, `pings`, the documents asked to be fiscalized again (`refiscalized`), and every call
 with the intermediary and the service it stood in for (`calls`), so a test can see a document followed up where it went.
@@ -301,8 +333,10 @@ extension and returns what is wrong, or an empty array.
 
 ## Schemas
 
-The XML schemas in `resources/ubl` are OASIS's UBL 2.1 and the Croatian Tax Administration's extension, included
-unchanged. They keep their own terms and are not covered by this package's license; see
+The XML schemas in `resources/ubl` are OASIS's UBL 2.1 and the Croatian Tax Administration's extension, included as
+their publishers distribute them. Two of the UBL files, `UBL-CommonExtensionComponents-2.1.xsd` and
+`UBL-ExtensionContentDataType-2.1.xsd`, are the Tax Administration's modified copies, which carry its extension, not
+OASIS's own. They keep their own terms and are not covered by this package's license; see
 [resources/ubl/NOTICE.md](resources/ubl/NOTICE.md).
 
 ## License

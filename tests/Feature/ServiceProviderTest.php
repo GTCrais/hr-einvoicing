@@ -47,6 +47,33 @@ it('hands out each intermediary\'s gateway by name, once, and knows which names 
 		->and(GatewayManager::INTERMEDIARIES)->toBe(['mojeracun', 'eposlovanje']);
 });
 
+it('takes a blank service for none, handing out the free client that follows the account\'s own service, never one held to the demo service', function () {
+	Http::preventStrayRequests();
+	config(['hrEInvoicing.allowProductionAnywhere' => true]);
+	app()->instance(AccountProvider::class, new class implements AccountProvider
+	{
+		public function account(): ?array
+		{
+			return ['username' => '10001', 'password' => 'tajna', 'companyId' => '12345678903', 'companyBU' => null, 'softwareId' => 'Test-002', 'environment' => 'production'];
+		}
+	});
+	Http::fake(['https://www.moj-eracun.hr/apis/v2/send' => Http::response(['ElectronicId' => 81, 'StatusId' => 30])]);
+	$manager = app(GatewayManager::class);
+
+	$blank = $manager->driver('mojeracun', '');
+
+	expect($blank)->toBe($manager->driver('mojeracun'))
+		->and($blank->send('<Invoice/>')['electronicId'])->toBe('81');
+
+	// With the fake as the gateway, the fake itself, and each intermediary as free as asked for no service
+	config(['hrEInvoicing.gateway' => 'fake']);
+	$manager->driver('mojeracun', '')->ping();
+
+	expect($manager->driver(null, ''))->toBe($manager->fake())
+		->and($manager->driver('mojeracun', ''))->toBe($manager->driver('mojeracun'))
+		->and($manager->fake()->calls)->toBe([['method' => 'ping', 'electronicId' => null, 'intermediary' => 'mojeracun', 'environment' => 'production']]);
+});
+
 it('takes the configured Moj-eRačun account, complete or not at all', function () {
 	config(['hrEInvoicing.mojEracun' => [
 		'environment' => 'demo',

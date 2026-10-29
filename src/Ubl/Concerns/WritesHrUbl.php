@@ -12,7 +12,11 @@ use GTCrais\HrEInvoicing\Ubl\HrUbl;
  * its own invoices onto them: the document with its namespaces, the extensions (the Croatian VAT breakdown and the
  * signature block the intermediary fills), the heading, references to earlier invoices, the parties named by OIB,
  * delivery, payment by transfer, the VAT breakdown, the totals and the lines. Elements without text are left out,
- * as the rules forbid empty ones.
+ * as the rules forbid empty ones: a value blank once trimmed writes no element, and a part none of whose elements was
+ * written (a contact without its operator, an account without its IBAN, a delivery without its day) is left out with
+ * them. Text goes in as XML 1.0 takes it, whatever was typed or pasted: a character it forbids (a control character,
+ * such as the line break Word pastes, U+000B) is left out, the vertical tab and the form feed as a space, so one stray
+ * character never leaves a document no intermediary can read.
  *
  * A VAT category is an array of the id ("S" standard, "E" exempt, "O" outside the scope of VAT, which every line of an
  * issuer outside the VAT system is), the Croatian name ("HR:PDV25", "HR:E", "HR:O"), the percent and the exemption's
@@ -74,10 +78,15 @@ trait WritesHrUbl
 
 	/**
 	 * A reference to an earlier invoice by its number and day of issue: the one a storno cancels, the one a credit
-	 * note takes back from, or an advance an invoice takes off, which says what was paid with it.
+	 * note takes back from, or an advance an invoice takes off, which says what was paid with it. None without the
+	 * number, which is what the reference refers by (the one part of it the schema requires).
 	 */
 	protected function billingReference(DOMElement $root, string $number, string $issueDate, ?string $description = null): void
 	{
+		if ($this->xmlText($number) === null) {
+			return;
+		}
+
 		$reference = $this->child($this->child($root, 'cac:BillingReference'), 'cac:InvoiceDocumentReference');
 		$this->leaf($reference, 'cbc:ID', $number);
 		$this->leaf($reference, 'cbc:IssueDate', $issueDate);
@@ -110,6 +119,8 @@ trait WritesHrUbl
 		$contact = $this->child($supplier, 'cac:SellerContact');
 		$this->leaf($contact, 'cbc:ID', $operatorOib);
 		$this->leaf($contact, 'cbc:Name', $operatorName);
+
+		$this->pruneEmpty($supplier);
 	}
 
 	/**
@@ -125,7 +136,8 @@ trait WritesHrUbl
 	 */
 	protected function customerParty(DOMElement $root, array $party, bool $withVatIdentifier = true): void
 	{
-		$element = $this->child($this->child($root, 'cac:AccountingCustomerParty'), 'cac:Party');
+		$customer = $this->child($root, 'cac:AccountingCustomerParty');
+		$element = $this->child($customer, 'cac:Party');
 
 		$this->leaf($element, 'cbc:EndpointID', $party['oib'], ['schemeID' => HrUbl::OIB_SCHEME]);
 		$this->leaf($this->child($element, 'cac:PartyIdentification'), 'cbc:ID', HrUbl::OIB_SCHEME . ':' . $party['oib']);
@@ -140,18 +152,24 @@ trait WritesHrUbl
 		$legal = $this->child($element, 'cac:PartyLegalEntity');
 		$this->leaf($legal, 'cbc:RegistrationName', $party['name']);
 		$this->leaf($legal, 'cbc:CompanyID', $party['oib']);
+
+		$this->pruneEmpty($customer);
 	}
 
 	/**
-	 * The day what is invoiced was supplied.
+	 * The day what is invoiced was supplied; nothing without the day.
 	 */
 	protected function delivery(DOMElement $root, string $date): void
 	{
-		$this->leaf($this->child($root, 'cac:Delivery'), 'cbc:ActualDeliveryDate', $date);
+		$delivery = $this->child($root, 'cac:Delivery');
+		$this->leaf($delivery, 'cbc:ActualDeliveryDate', $date);
+
+		$this->pruneEmpty($delivery);
 	}
 
 	/**
-	 * Payment by credit transfer to the issuer's account, with the number as the payment reference.
+	 * Payment by credit transfer to the issuer's account, with the number as the payment reference; the account left
+	 * out without the IBAN.
 	 */
 	protected function paymentMeans(DOMElement $root, string $paymentId, string $iban): void
 	{
@@ -159,6 +177,8 @@ trait WritesHrUbl
 		$this->leaf($means, 'cbc:PaymentMeansCode', '30');
 		$this->leaf($means, 'cbc:PaymentID', $paymentId);
 		$this->leaf($this->child($means, 'cac:PayeeFinancialAccount'), 'cbc:ID', preg_replace('/\s+/', '', $iban));
+
+		$this->pruneEmpty($means);
 	}
 
 	/**
@@ -223,6 +243,9 @@ trait WritesHrUbl
 		$price = $this->child($element, 'cac:Price');
 		$this->leaf($price, 'cbc:PriceAmount', number_format($line['unit'], 6, '.', ''), ['currencyID' => $currency]);
 		$this->leaf($price, 'cbc:BaseQuantity', '1.000', ['unitCode' => HrUbl::UNIT]);
+
+		// A classification code given blank, say, leaves its part empty
+		$this->pruneEmpty($element);
 	}
 
 	/**
@@ -250,7 +273,7 @@ trait WritesHrUbl
 				$categories[$key]['code'] = null;
 			}
 
-			if (($category['reason'] ?? null) !== null && $category['reason'] !== '') {
+			if (trim((string) ($category['reason'] ?? '')) !== '') {
 				$reasons[$key][$category['reason']] = true;
 			}
 
@@ -327,6 +350,10 @@ trait WritesHrUbl
 		$this->leaf($this->child($address, 'cac:Country'), 'cbc:IdentificationCode', $country);
 	}
 
+	/**
+	 * A part of the document, written at once in its place: one that may get no element (every one of them left out for
+	 * want of a value) is pruned once written (pruneEmpty()), as the trait's own parts are.
+	 */
 	protected function child(DOMElement $parent, string $name): DOMElement
 	{
 		$element = $parent->ownerDocument->createElementNS($this->namespace($name), $name);
@@ -337,24 +364,67 @@ trait WritesHrUbl
 	}
 
 	/**
-	 * A leaf with text, left out when there is no text: the rules forbid empty elements.
+	 * A leaf with text, left out when there is no text: the rules forbid empty elements, and a value blank once trimmed
+	 * is none. The text, and the attributes', go in as XML 1.0 takes them (xmlText()).
 	 *
 	 * @param  array<string, string>  $attributes
 	 */
 	protected function leaf(DOMElement $parent, string $name, ?string $value, array $attributes = []): ?DOMElement
 	{
-		if ($value === null || $value === '') {
+		$text = $this->xmlText($value);
+
+		if ($text === null) {
 			return null;
 		}
 
 		$element = $this->child($parent, $name);
-		$element->appendChild($parent->ownerDocument->createTextNode($value));
+		$element->appendChild($parent->ownerDocument->createTextNode($text));
 
 		foreach ($attributes as $attribute => $attributeValue) {
-			$element->setAttribute($attribute, $attributeValue);
+			$element->setAttribute($attribute, (string) $this->xmlText($attributeValue));
 		}
 
 		return $element;
+	}
+
+	/**
+	 * A value as XML 1.0 takes it, null when it is blank once trimmed. A character outside XML's Char production makes
+	 * a document no parser reads, and such characters come in typed or pasted (Word's line break is U+000B): the vertical
+	 * tab and the form feed become a space, every other one is left out (the C0 control characters but the tab, the line
+	 * feed and the carriage return, and U+FFFE and U+FFFF), and bytes that are no UTF-8 become "?". The rest is written
+	 * as given, untrimmed, so a number is the number the app keeps.
+	 */
+	protected function xmlText(?string $value): ?string
+	{
+		if ($value === null) {
+			return null;
+		}
+
+		$text = (string) preg_replace(
+			'/[^\x{9}\x{A}\x{D}\x{20}-\x{D7FF}\x{E000}-\x{FFFD}\x{10000}-\x{10FFFF}]/u',
+			'',
+			str_replace(["\v", "\f"], ' ', mb_scrub($value, 'UTF-8'))
+		);
+
+		return trim($text) === '' ? null : $text;
+	}
+
+	/**
+	 * Leave out the elements under this one that nothing was written into, and this one too when it is left empty: a
+	 * part every element of which was left out is an empty element, which the rules forbid. Never ask it of the root or
+	 * the extensions, whose signature block stays empty for the intermediary to fill.
+	 */
+	protected function pruneEmpty(DOMElement $element): void
+	{
+		foreach (iterator_to_array($element->childNodes) as $node) {
+			if ($node instanceof DOMElement) {
+				$this->pruneEmpty($node);
+			}
+		}
+
+		if (!$element->hasChildNodes() && !$element->hasAttributes()) {
+			$element->parentNode?->removeChild($element);
+		}
 	}
 
 	protected function amount(DOMElement $parent, string $name, float $value, string $currency): void

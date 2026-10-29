@@ -230,6 +230,52 @@ it('writes a credit note as a CreditNote document, which the credit note schema 
 		->and($xpath->evaluate('count(/cn:CreditNote/cac:Delivery)'))->toBe(0.0);
 });
 
+it('writes text as XML 1.0 takes it, a pasted line break as a space and every character XML forbids left out, and leaves a value of only blanks out, so the document parses and holds to the schema', function () {
+	$xml = (new ExampleInvoiceBuilder)->build(exampleInvoice([
+		'customer' => ['oib' => '98765432106', 'name' => "Tvrtka\x01 Kupac\u{FFFE} d.o.o.\x1F", 'street' => " \t\v ", 'city' => "Split\fZapad", 'postalCode' => '21000', 'country' => 'HR'],
+		'lines' => [
+			// Word's line break (U+000B), a noncharacter, and a NUL in the exemption's reason
+			['name' => "Pregled\vkože\u{FFFF}", 'quantity' => 1, 'net' => 80.0, 'tax' => 0.0, 'kpd' => '86.22.19', 'category' => exemption('VATEX-EU-132-1C', "Oslobođeno PDV-a:\x00 zdravstvena usluga")],
+			// A byte that is no UTF-8 (Windows-1250's "č")
+			['name' => "Krema \xE8 za sunčanje", 'quantity' => 1, 'net' => 20.0, 'tax' => 5.0, 'kpd' => '20.42.19', 'category' => standardRate(25.0)],
+		],
+	]));
+	$xpath = exampleXpath($xml);
+
+	expect(UblSchema::errors($xml))->toBe([])
+		->and($xpath->evaluate('string(/inv:Invoice/cac:InvoiceLine[1]/cac:Item/cbc:Name)'))->toBe('Pregled kože')
+		->and($xpath->evaluate('string(/inv:Invoice/cac:InvoiceLine[1]/cac:Item/cac:ClassifiedTaxCategory/cbc:TaxExemptionReason)'))->toBe('Oslobođeno PDV-a: zdravstvena usluga')
+		->and($xpath->evaluate('string(/inv:Invoice/cac:InvoiceLine[2]/cac:Item/cbc:Name)'))->toBe('Krema ? za sunčanje')
+		->and($xpath->evaluate('string(//cac:AccountingCustomerParty/cac:Party/cac:PartyLegalEntity/cbc:RegistrationName)'))->toBe('Tvrtka Kupac d.o.o.')
+		->and($xpath->evaluate('string(//cac:AccountingCustomerParty/cac:Party/cac:PostalAddress/cbc:CityName)'))->toBe('Split Zapad')
+		->and($xpath->evaluate('count(//cac:AccountingCustomerParty/cac:Party/cac:PostalAddress/cbc:StreetName)'))->toBe(0.0)
+		->and(collect(iterator_to_array($xpath->query('//*[not(node())]')))->map->localName->all())->toBe(['SignatureInformation']);
+});
+
+it('leaves out a part none of whose elements was written, and a reference without the number it refers by, so the document holds to the schema', function () {
+	$xml = (new ExampleInvoiceBuilder)->build(exampleInvoice([
+		'refersTo' => ['number' => ' ', 'issueDate' => '2026-10-23'],
+		'operatorOib' => '',
+		'operator' => '',
+		'deliveredOn' => '',
+		'iban' => ' ',
+		'lines' => [
+			['name' => 'Krema za sunčanje', 'quantity' => 1, 'net' => 20.0, 'tax' => 5.0, 'kpd' => '', 'category' => standardRate(25.0)],
+		],
+	]));
+	$xpath = exampleXpath($xml);
+
+	expect(UblSchema::errors($xml))->toBe([])
+		->and($xpath->evaluate('count(//cac:BillingReference)'))->toBe(0.0)
+		->and($xpath->evaluate('count(//cac:SellerContact)'))->toBe(0.0)
+		->and($xpath->evaluate('count(//cac:Delivery)'))->toBe(0.0)
+		->and($xpath->evaluate('count(//cac:PayeeFinancialAccount)'))->toBe(0.0)
+		->and($xpath->evaluate('count(//cac:CommodityClassification)'))->toBe(0.0)
+		// What was written of a part stays
+		->and($xpath->evaluate('string(/inv:Invoice/cac:PaymentMeans/cbc:PaymentID)'))->toBe('17/P1/1')
+		->and(collect(iterator_to_array($xpath->query('//*[not(node())]')))->map->localName->all())->toBe(['SignatureInformation']);
+});
+
 it('says what the schema has against a document that breaks it', function () {
 	expect(UblSchema::errors('<Invoice xmlns="' . HrUbl::NAMESPACES[''] . '"/>'))->not->toBe([])
 		->and(UblSchema::errors('<CreditNote xmlns="' . HrUbl::CREDIT_NOTE_NAMESPACE . '"><Unknown/></CreditNote>'))->not->toBe([]);

@@ -40,6 +40,11 @@ class GatewayManager
 
 	public function driver(?string $name = null, ?string $environment = null): EInvoiceGateway
 	{
+		// A blank service (one stored empty with a document) names none: driver($name, '') is driver($name), the free client,
+		// never one held to the demo service that driver($name) would then answer with too; any other is kept by the
+		// service its client is held to
+		$environment = blank($environment) ? null : ($environment === 'production' ? 'production' : 'demo');
+
 		// The fake answers for every intermediary when the gateway is "fake", or when "fake" is on with the gateway naming
 		// the intermediary a test suite stands in for
 		$faked = config('hrEInvoicing.gateway') === 'fake' || (bool) config('hrEInvoicing.fake', false);

@@ -21,7 +21,7 @@ it('keeps what was sent and reported, and answers with the standing a test set a
 
 	expect($sent)->toBe(['electronicId' => '1001', 'status' => DocumentStatus::SENT])
 		->and($gateway->sent)->toHaveCount(1)
-		->and($gateway->status('1001'))->toBe(['status' => DocumentStatus::DELIVERED, 'fiscalization' => FiscalizationStatus::FAILED, 'error' => 'S005 Poruka nije u skladu s XML shemom', 'payment' => FiscalizationStatus::FISCALIZED, 'paymentError' => null, 'paymentReports' => 1, 'answersError' => null])
+		->and($gateway->status('1001'))->toBe(['status' => DocumentStatus::DELIVERED, 'fiscalization' => FiscalizationStatus::FAILED, 'error' => 'S005 Poruka nije u skladu s XML shemom', 'payment' => FiscalizationStatus::FISCALIZED, 'paymentError' => null, 'paymentReports' => 1, 'answersError' => null, 'rejectionReason' => null, 'fiscalizationError' => 'S005 Poruka nije u skladu s XML shemom'])
 		// One it never sent, nor was given a standing for, it does not know, as the real ones
 		->and(fn () => $gateway->status('1002'))->toThrow(RuntimeException::class, 'The intermediary does not know the document 1002.')
 		->and(fn () => $gateway->reportPayment('1002', '2026-10-22', 10.0))->toThrow(RuntimeException::class, 'The intermediary does not know the document 1002.')
@@ -213,4 +213,68 @@ it('is ready and calls only with an account there, as the real client is', funct
 		// Held to the service its one account is not on, it has none
 		->and($manager->driver('eposlovanje', 'production')->ready())->toBeFalse()
 		->and($manager->fake()->sent)->toBe([]);
+});
+
+it('refuses a document of a number it holds for the year on the same intermediary and service, as the real ones do, unless the one it holds was refused', function () {
+	$manager = fakeWithAccounts();
+	$fake = $manager->fake();
+	$invoice = '<Invoice><cbc:ID>12/P1/1</cbc:ID><cbc:IssueDate>2026-10-23</cbc:IssueDate></Invoice>';
+	$mojEracun = $manager->driver('mojeracun');
+
+	$first = $mojEracun->send($invoice);
+
+	expect(fn () => $mojEracun->send($invoice))->toThrow(EInvoiceRefusedException::class, 'already exists with EID=1001')
+		// The number of the next year's document, and the same document through another intermediary, are no duplicates
+		->and($mojEracun->send(str_replace('2026-10-23', '2027-01-04', $invoice))['electronicId'])->toBe('1002')
+		->and($manager->driver('eposlovanje')->send($invoice)['electronicId'])->toBe('1003');
+
+	// Nor is it on the other service
+	config(['hrEInvoicing.mojEracun.environment' => 'production', 'hrEInvoicing.allowProductionAnywhere' => true]);
+
+	expect($manager->driver('mojeracun', 'production')->send($invoice)['electronicId'])->toBe('1004');
+
+	// One the intermediary could not process is refused, and the corrected document goes again under its number
+	$fake->setStatus($first['electronicId'], DocumentStatus::REFUSED, error: 'Neuspjelo');
+
+	expect($mojEracun->send($invoice)['electronicId'])->toBe('1005')
+		->and($fake->sent)->toHaveCount(5);
+});
+
+it('keeps a document whose answer was lost out of the next lookups of it when told to, refusing it sent again meanwhile, and finds it after', function () {
+	$gateway = new FakeEInvoiceGateway;
+	$invoice = '<Invoice><cbc:ID>7/P1/1</cbc:ID><cbc:IssueDate>2026-10-23</cbc:IssueDate></Invoice>';
+	$gateway->loseNextAnswer();
+	$gateway->hideFromLookup(2);
+
+	expect(fn () => $gateway->send($invoice))->toThrow(RuntimeException::class, 'Operation timed out')
+		->and($gateway->sentDocument('7/P1/1', Carbon::now(), '2026-10-23'))->toBeNull()
+		->and(fn () => $gateway->send($invoice))->toThrow(EInvoiceRefusedException::class, 'already exists with EID=1001')
+		->and($gateway->sentDocument('7/P1/1', Carbon::now(), '2026-10-23'))->toBeNull()
+		->and($gateway->sentDocument('7/P1/1', Carbon::now(), '2026-10-23'))->toBe(['electronicId' => '1001', 'status' => DocumentStatus::SENT])
+		->and($gateway->sent)->toHaveCount(1);
+});
+
+it('refuses a document only when one is sent and finds the service down only when the connection is tested, as the real clients throw them, so a lookup or a status asked first passes', function () {
+	$gateway = new FakeEInvoiceGateway;
+	$sent = $gateway->send('<Invoice><cbc:ID>1/P1/1</cbc:ID></Invoice>');
+	$gateway->refuseNext();
+	$gateway->unavailableNext();
+
+	expect($gateway->sentDocument('2/P1/1', Carbon::now()))->toBeNull()
+		->and($gateway->status($sent['electronicId'])['status'])->toBe(DocumentStatus::SENT)
+		->and(fn () => $gateway->send('<Invoice><cbc:ID>2/P1/1</cbc:ID></Invoice>'))->toThrow(EInvoiceRefusedException::class, 'HR-BR-37')
+		->and(fn () => $gateway->ping())->toThrow(EInvoiceUnavailableException::class, 'HTTP 500')
+		->and($gateway->send('<Invoice><cbc:ID>2/P1/1</cbc:ID></Invoice>')['electronicId'])->toBe('1002')
+		->and($gateway->pings)->toBe(0);
+});
+
+it('leaves the tax authority\'s answers and their reasons unknown while they cannot be read, as the real clients do, keeping why a rejected document will not reach the buyer', function () {
+	$gateway = new FakeEInvoiceGateway;
+	$delivered = $gateway->send('<Invoice><cbc:ID>1/P1/1</cbc:ID></Invoice>')['electronicId'];
+	$rejected = $gateway->send('<Invoice><cbc:ID>2/P1/1</cbc:ID></Invoice>')['electronicId'];
+	$gateway->setStatus($delivered, DocumentStatus::DELIVERED, FiscalizationStatus::FAILED, 'S006 Pristupna točka nije ovlaštena za dostavu podataka', FiscalizationStatus::FAILED, 'S007 OIB iz zahtjeva nije formalno ispravan', answersError: 'HTTP 503: Service Unavailable');
+	$gateway->setStatus($rejected, DocumentStatus::REJECTED, FiscalizationStatus::FISCALIZED, 'Neuspješna dostava', answersError: 'HTTP 503: Service Unavailable');
+
+	expect($gateway->status($delivered))->toBe(['status' => DocumentStatus::DELIVERED, 'fiscalization' => null, 'error' => null, 'payment' => null, 'paymentError' => null, 'paymentReports' => null, 'answersError' => 'HTTP 503: Service Unavailable', 'rejectionReason' => null, 'fiscalizationError' => null])
+		->and($gateway->status($rejected))->toBe(['status' => DocumentStatus::REJECTED, 'fiscalization' => null, 'error' => 'Neuspješna dostava', 'payment' => null, 'paymentError' => null, 'paymentReports' => null, 'answersError' => 'HTTP 503: Service Unavailable', 'rejectionReason' => 'Neuspješna dostava', 'fiscalizationError' => null]);
 });

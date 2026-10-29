@@ -5,13 +5,15 @@ namespace GTCrais\HrEInvoicing\MojEracun;
 use Carbon\CarbonImmutable;
 use DateTimeInterface;
 use GTCrais\HrEInvoicing\Concerns\ChoosesEnvironment;
+use GTCrais\HrEInvoicing\Concerns\RedactsSecrets;
 use GTCrais\HrEInvoicing\Contracts\EInvoiceGateway;
 use GTCrais\HrEInvoicing\DocumentStatus;
 use GTCrais\HrEInvoicing\Exceptions\EInvoiceRefusedException;
 use GTCrais\HrEInvoicing\Exceptions\EInvoiceUnavailableException;
 use GTCrais\HrEInvoicing\FiscalizationStatus;
 use GTCrais\HrEInvoicing\MojEracun\Contracts\AccountProvider;
-use Illuminate\Http\Client\ConnectionException;
+use Illuminate\Http\Client\HttpClientException;
+use Illuminate\Http\Client\RequestException;
 use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\Http;
 use RuntimeException;
@@ -22,15 +24,18 @@ use RuntimeException;
  * one and the software identifier), the document goes as the XML text of a JSON request, and the answers come back
  * as JSON whose keys are written now with a capital and now without, so they are read either way. A query answers
  * with a list; the tax authority's answers about an e-invoice come as a list of documents, each with its messages,
- * and as a 404 while there are none yet. Moj-eRačun's status codes (20 taken in, 30 sent, 40 delivered, 50 not
- * processed or not delivered, which is refused and final: the document was never exchanged, so the tax authority never
- * saw it and never will, as Moj-eRačun confirmed on 2026-10-27; 70 reported to the tax authority because the buyer
- * takes no e-invoices) become the package's DocumentStatus. The environment is "demo" or "production", the account's
- * own when it names one, and a call may take attemptSeconds; the service provider builds it from config('hrEInvoicing').
+ * and as a 404 of Moj-eRačun's own while there are none yet. Moj-eRačun's status codes (20 taken in, 30 sent, 40
+ * delivered, 50 not processed or not delivered, which is refused and final: the document was never exchanged, so the
+ * tax authority never saw it and never will, as Moj-eRačun confirmed on 2026-10-27; 70 reported to the tax authority
+ * because the buyer takes no e-invoices) become the package's DocumentStatus; no code is read as the buyer's rejection,
+ * as the package asks Moj-eRačun for no processing status of the buyer's. The environment is "demo" or "production",
+ * the account's own when it names one, and a call may take attemptSeconds; the service provider builds it from
+ * config('hrEInvoicing'). A failure's message never carries the account's password.
  */
 class MojEracunClient implements EInvoiceGateway
 {
 	use ChoosesEnvironment;
+	use RedactsSecrets;
 
 	/** The intermediary's services by environment */
 	public const array SERVICES = [
@@ -57,7 +62,8 @@ class MojEracunClient implements EInvoiceGateway
 
 	public function send(string $xml): array
 	{
-		$document = $this->post('/apis/v2/send', ['file' => $xml], refusable: true);
+		$account = $this->account();
+		$document = $this->post('/apis/v2/send', ['file' => $xml], refusable: true, account: $account);
 
 		// A send it will not take for a condition of sending answers 200 without a document: one whose number, issuer,
 		// buyer and year it holds already ("already exists with EID=…", the demo's words of 2026-10-26) is refused, as the
@@ -65,7 +71,8 @@ class MojEracunClient implements EInvoiceGateway
 		$prerequisites = $this->value($document, 'PrerequisitesValidationFailed');
 
 		if (is_array($prerequisites)) {
-			$reason = 'HTTP 200: ' . (trim(implode(' ', array_map(strval(...), (array) ($this->value($prerequisites, 'Messages') ?? [])))) ?: 'the conditions for sending are not met');
+			$reason = 'HTTP 200: ' . (trim(implode(' ', array_map(strval(...), array_filter((array) ($this->value($prerequisites, 'Messages') ?? []), is_scalar(...))))) ?: 'the conditions for sending are not met');
+			$reason = $this->redact($reason, $this->secrets($account));
 
 			throw preg_match('/already exists|već postoji/iu', $reason) ? new EInvoiceRefusedException($reason) : new RuntimeException($reason);
 		}
@@ -126,7 +133,10 @@ class MojEracunClient implements EInvoiceGateway
 		// never will, no report of it exists, and the standing is final (Moj-eRačun, 2026-10-27); statusOutbox is not asked
 		// about it, as the demo's mock messages would say otherwise
 		if ($status === DocumentStatus::REFUSED) {
-			return ['status' => DocumentStatus::REFUSED, 'fiscalization' => null, 'error' => trim((string) ($this->value($document, 'StatusName') ?? '')) ?: null, 'payment' => null, 'paymentError' => null, 'paymentReports' => 0, 'answersError' => null];
+			return [
+				'status' => DocumentStatus::REFUSED, 'fiscalization' => null, 'error' => trim((string) ($this->value($document, 'StatusName') ?? '')) ?: null, 'payment' => null, 'paymentError' => null, 'paymentReports' => 0, 'answersError' => null,
+				'rejectionReason' => null, 'fiscalizationError' => null,
+			];
 		}
 
 		// The tax authority's answers come from a call of their own: one that fails leaves the standing known and the
@@ -147,7 +157,11 @@ class MojEracunClient implements EInvoiceGateway
 			? collect($messages)->filter(fn (array $message) => (int) $this->value($message, 'messageType') === self::PAYMENT_MESSAGE_TYPE)->count()
 			: null;
 
-		return ['status' => $status, 'fiscalization' => $fiscalization, 'error' => $error, 'payment' => $payment, 'paymentError' => $paymentError, 'paymentReports' => $paymentReports, 'answersError' => $answersError];
+		// Moj-eRačun is asked for no processing status of the buyer's, so none of its documents is rejected
+		return [
+			'status' => $status, 'fiscalization' => $fiscalization, 'error' => $error, 'payment' => $payment, 'paymentError' => $paymentError, 'paymentReports' => $paymentReports, 'answersError' => $answersError,
+			'rejectionReason' => null, 'fiscalizationError' => $error,
+		];
 	}
 
 	public function reportPayment(string $electronicId, string $paidOn, float $amount): void
@@ -162,13 +176,14 @@ class MojEracunClient implements EInvoiceGateway
 
 	public function ping(): void
 	{
-		$account = $this->accountOf($this->accounts) ?? throw new RuntimeException('The intermediary account is not set up.');
+		$account = $this->account();
 
-		// The service answers its ping without the account; while it does not, the account cannot be checked
+		// The service answers its ping without the account; while it does not, or its answer is cut off on the way, the
+		// account cannot be checked
 		try {
 			$response = Http::acceptJson()->timeout($this->seconds())->get($this->url('/apis/v2/Ping/', $account));
-		} catch (ConnectionException $exception) {
-			throw new EInvoiceUnavailableException($exception->getMessage());
+		} catch (HttpClientException $exception) {
+			throw new EInvoiceUnavailableException($this->transportFailure($exception, $account));
 		}
 
 		if (!$response->successful()) {
@@ -177,7 +192,7 @@ class MojEracunClient implements EInvoiceGateway
 
 		// The account itself is proven by a query that needs it; an empty outbox answers 404 "Nema dokumenata.", which
 		// the service gives only to an account it took
-		$this->post('/apis/v2/queryOutbox', ['from' => CarbonImmutable::now()->subDay()->toDateString(), 'to' => CarbonImmutable::now()->toDateString()], quietlyMissing: true);
+		$this->post('/apis/v2/queryOutbox', ['from' => CarbonImmutable::now()->subDay()->toDateString(), 'to' => CarbonImmutable::now()->toDateString()], quietlyMissing: true, account: $account);
 	}
 
 	/**
@@ -205,8 +220,9 @@ class MojEracunClient implements EInvoiceGateway
 
 	/**
 	 * The tax authority's answers about the e-invoice, each with its type; none while it has given none (the service's
-	 * 404). Any other failure is thrown: a standing without the answers would tell a payment already reported as one
-	 * never reported, and an app that reports it again on that reports the money twice.
+	 * own 404). Any other failure is thrown, a 404 that is not Moj-eRačun's own answer included: a standing without the
+	 * answers would tell a payment already reported as one never reported, and an app that reports it again on that
+	 * reports the money twice.
 	 *
 	 * @return list<array<string, mixed>>
 	 */
@@ -262,46 +278,93 @@ class MojEracunClient implements EInvoiceGateway
 	}
 
 	/**
-	 * A JSON call with the account; the intermediary's refusal becomes an exception with its message. A 404 is no
-	 * error for the calls that answer it while they have nothing to tell, and comes back empty.
+	 * A JSON call with the account (the one given, else the provider's); the intermediary's refusal becomes an exception
+	 * with its message. A 404 of Moj-eRačun's own is no error for the calls that answer it while they have nothing to
+	 * tell, and comes back empty; any other 404 (a proxy's page, a route moved) is thrown, as it says nothing of what
+	 * Moj-eRačun holds. A call that got no whole answer (none at all, or one cut off on its way) may pass on a later try.
 	 *
 	 * @param  array<string, mixed>  $payload
+	 * @param  array<string, mixed>|null  $account
 	 * @return array<int|string, mixed>
 	 */
-	protected function post(string $path, array $payload, bool $quietlyMissing = false, bool $refusable = false): array
+	protected function post(string $path, array $payload, bool $quietlyMissing = false, bool $refusable = false, ?array $account = null): array
 	{
-		$account = $this->accountOf($this->accounts) ?? throw new RuntimeException('The intermediary account is not set up.');
+		$account ??= $this->account();
 		$url = $this->url($path, $account);
-
-		// The service's environment is the account's affair, not the service's
-		unset($account['environment']);
 
 		try {
 			$response = Http::acceptJson()
 				->timeout($this->seconds())
 				->connectTimeout(5)
-				->post($url, [...$account, ...$payload]);
-		} catch (ConnectionException $exception) {
-			throw new RuntimeException($exception->getMessage());
+				// The service's environment is the account's affair, not the service's
+				->post($url, [...array_diff_key($account, ['environment' => true]), ...$payload]);
+		} catch (HttpClientException $exception) {
+			throw new RuntimeException($this->transportFailure($exception, $account));
 		}
 
-		if ($quietlyMissing && $response->status() === 404) {
+		if ($quietlyMissing && $response->status() === 404 && $this->ownAnswer($response)) {
 			return [];
 		}
 
 		// A document it could not take is refused for good; anything else, a refusal of the account included (a wrong
 		// software identifier, a password), and any other call it refuses, may pass on a later try
 		if ($refusable && in_array($response->status(), [400, 422], true) && $this->refusesDocument($response)) {
-			throw new EInvoiceRefusedException($this->failure($response));
+			throw new EInvoiceRefusedException($this->failure($response, $account));
 		}
 
 		if (!$response->successful()) {
-			throw new RuntimeException($this->failure($response));
+			throw new RuntimeException($this->failure($response, $account));
 		}
 
 		$json = $response->json();
 
 		return is_array($json) ? $json : [];
+	}
+
+	/**
+	 * Whether an answer is Moj-eRačun's own JSON, as it words a 404 while it has nothing to tell: an object with its
+	 * message or its trace identifier ({"message": "Nema dokumenata.", "traceId": …}).
+	 */
+	protected function ownAnswer(Response $response): bool
+	{
+		$json = $response->json();
+
+		return is_array($json) && !array_is_list($json)
+			&& (is_string($this->value($json, 'message')) || is_string($this->value($json, 'traceId')));
+	}
+
+	/**
+	 * Why a call got no whole answer: a RequestException carries what arrived of it (a status, and the body as far as it
+	 * came), read as any other refusal; any other failure says itself. Never with the account's password.
+	 *
+	 * @param  array<string, mixed>  $account
+	 */
+	protected function transportFailure(HttpClientException $exception, array $account): string
+	{
+		return $exception instanceof RequestException
+			? $this->failure($exception->response, $account)
+			: $this->redact($exception->getMessage(), $this->secrets($account));
+	}
+
+	/**
+	 * The account to call with; a RuntimeException while the provider gives none.
+	 *
+	 * @return array<string, mixed>
+	 */
+	protected function account(): array
+	{
+		return $this->accountOf($this->accounts) ?? throw new RuntimeException('The intermediary account is not set up.');
+	}
+
+	/**
+	 * What of the account must never be said: its password.
+	 *
+	 * @param  array<string, mixed>|null  $account
+	 * @return list<mixed>
+	 */
+	protected function secrets(?array $account): array
+	{
+		return [$account['password'] ?? null];
 	}
 
 	/**
@@ -345,36 +408,76 @@ class MojEracunClient implements EInvoiceGateway
 	}
 
 	/**
-	 * Why the intermediary refused: the rules the document broke, the tax authority's code and reason, or the
-	 * message, else the start of the body.
+	 * Why the intermediary refused: the rules the document broke, the tax authority's code and reason, the message, or
+	 * the fields it refused with their messages, else the start of the body; never with the account's password.
+	 *
+	 * @param  array<string, mixed>|null  $account
 	 */
-	protected function failure(Response $response): string
+	protected function failure(Response $response, ?array $account): string
 	{
 		$json = $response->json();
-		$prefix = 'HTTP ' . $response->status() . ': ';
+		$reason = is_array($json) ? $this->answerReason($json) : null;
 
-		if (is_array($json)) {
-			$file = $this->value($json, 'File');
-			$rules = is_array($file) ? (array) ($this->value($file, 'Messages') ?? []) : [];
-
-			if ($rules !== []) {
-				return $prefix . implode(' ', array_map(strval(...), $rules));
-			}
-
-			$message = $this->value($json, 'message') ?? $this->value($json, 'error') ?? $this->value($json, 'title');
-			$message = is_string($message) || $message === null ? $message : json_encode($message);
-			$specifics = $this->value($json, 'taxAdministrationSpecifics');
-
-			if (is_array($specifics) && filled($this->value($specifics, 'code'))) {
-				return $prefix . trim($this->value($specifics, 'code') . ' ' . $this->value($specifics, 'description') . (filled($message) ? ' (' . $message . ')' : ''));
-			}
-
-			if (filled($message)) {
-				return $prefix . $message;
-			}
+		if ($reason !== null) {
+			return 'HTTP ' . $response->status() . ': ' . $this->redact($reason, $this->secrets($account));
 		}
 
-		return 'HTTP ' . $response->status() . ($response->body() !== '' ? ': ' . mb_substr(trim($response->body()), 0, 300) : '');
+		$excerpt = $this->bodyExcerpt($response->body(), $this->secrets($account));
+
+		return 'HTTP ' . $response->status() . ($excerpt !== '' ? ': ' . $excerpt : '');
+	}
+
+	/**
+	 * What an answer of Moj-eRačun says of why it refused, if anything: the rules the document broke ("File"), the tax
+	 * authority's code and reason with the message, the message, or the fields it refused.
+	 *
+	 * @param  array<int|string, mixed>  $json
+	 */
+	protected function answerReason(array $json): ?string
+	{
+		$file = $this->value($json, 'File');
+		$rules = is_array($file) ? array_filter((array) ($this->value($file, 'Messages') ?? []), is_scalar(...)) : [];
+
+		if ($rules !== []) {
+			return implode(' ', array_map(strval(...), $rules));
+		}
+
+		$message = $this->value($json, 'message') ?? $this->value($json, 'error') ?? $this->value($json, 'title');
+		$message = is_string($message) || $message === null ? $message : json_encode($message, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+		$specifics = $this->value($json, 'taxAdministrationSpecifics');
+
+		if (is_array($specifics) && filled($this->value($specifics, 'code'))) {
+			return trim($this->value($specifics, 'code') . ' ' . $this->value($specifics, 'description') . (filled($message) ? ' (' . $message . ')' : ''));
+		}
+
+		if (filled($message)) {
+			return $message;
+		}
+
+		return $this->refusedFields($json);
+	}
+
+	/**
+	 * The fields an answer refuses, in Moj-eRačun's shape for a request it will not take ({"SoftwareId": {"Value": …,
+	 * "Messages": […]}}), as "SoftwareId: its messages", fields apart by "; ": never the value it echoes with them, which
+	 * for the password is the password; null when the answer refuses no field.
+	 *
+	 * @param  array<int|string, mixed>  $json
+	 */
+	protected function refusedFields(array $json): ?string
+	{
+		$fields = [];
+
+		foreach ($json as $field => $answer) {
+			if (!is_string($field) || !is_array($answer) || ($this->value($answer, 'Messages') === null && $this->value($answer, 'Value') === null)) {
+				continue;
+			}
+
+			$messages = trim(implode(' ', array_map(strval(...), array_filter((array) ($this->value($answer, 'Messages') ?? []), is_scalar(...)))));
+			$fields[] = $field . ($messages !== '' ? ': ' . $messages : '');
+		}
+
+		return $fields === [] ? null : implode('; ', $fields);
 	}
 
 	/**

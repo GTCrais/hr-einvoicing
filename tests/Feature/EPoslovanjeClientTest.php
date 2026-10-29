@@ -267,18 +267,29 @@ it('reads the document standing and the tax authority answer off the status answ
 			$request(['createdOn' => '2026-10-24T20:12:02.277', 'success' => false, 'errorCode' => 'S006', 'errorDescription' => 'Pristupna točka nije ovlaštena za dostavu podataka', 'completedOn' => '2026-10-24T20:12:02.497']),
 			['type' => 4, 'description' => 'Evidencija naplate računa', 'createdOn' => '2026-10-24T20:18:19.1', 'success' => false, 'errorCode' => 'S006', 'errorDescription' => 'Pristupna točka nije ovlaštena za dostavu podataka', 'completedOn' => '2026-10-24T20:18:19.197'],
 		]]),
+		// Rejected by the buyer, and its fiscalization refused by the tax authority too
+		'https://test.eposlovanje.hr/api/v2/document/status/12' => Http::response(['id' => 12, 'status' => 6, 'statusHistory' => [
+			['createdOn' => '2026-10-24T12:30:00+02:00', 'status' => 6, 'statusText' => 'Odbijen', 'note' => 'iznos nije ispravan'],
+		], 'eReportingRequests' => [
+			$request(['createdOn' => '2026-10-24T12:00:00+02:00', 'success' => false, 'errorCode' => 'S006', 'errorDescription' => 'Pristupna točka nije ovlaštena za dostavu podataka', 'completedOn' => '2026-10-24T12:00:05+02:00']),
+		]]),
 	]);
 	$client = app(EPoslovanjeClient::class);
 
-	$answer = fn (DocumentStatus $status, ?FiscalizationStatus $fiscalization, ?string $error, ?FiscalizationStatus $payment = null, ?string $paymentError = null, int $paymentReports = 0) => [...compact('status', 'fiscalization', 'error', 'payment', 'paymentError', 'paymentReports'), 'answersError' => null];
+	// The reason to keep is the tax authority's for any but a rejected document, which it is kept apart for too
+	$answer = fn (DocumentStatus $status, ?FiscalizationStatus $fiscalization, ?string $error, ?FiscalizationStatus $payment = null, ?string $paymentError = null, int $paymentReports = 0) => [...compact('status', 'fiscalization', 'error', 'payment', 'paymentError', 'paymentReports'), 'answersError' => null, 'rejectionReason' => null, 'fiscalizationError' => $error];
+	$rejected = fn (?FiscalizationStatus $fiscalization, string $reason, ?string $fiscalizationError = null) => [...$answer(DocumentStatus::REJECTED, $fiscalization, $reason), 'rejectionReason' => $reason, 'fiscalizationError' => $fiscalizationError];
 
 	expect($client->status('1'))->toBe($answer(DocumentStatus::DELIVERED, FiscalizationStatus::FISCALIZED, null))
 		// A fiscalization taken stays taken, a refused duplicate after it changes nothing; the payment report is apart
 		->and($client->status('2'))->toBe($answer(DocumentStatus::SENT, FiscalizationStatus::FISCALIZED, null, FiscalizationStatus::FISCALIZED, paymentReports: 1))
 		->and($client->status('3'))->toBe($answer(DocumentStatus::SENT, FiscalizationStatus::WAITING, null))
 		->and($client->status('4'))->toBe($answer(DocumentStatus::SENT, null, null))
-		->and($client->status('5'))->toBe($answer(DocumentStatus::REJECTED, FiscalizationStatus::FISCALIZED, 'Odbijen jer iznos nije ispravan'))
-		->and($client->status('6'))->toBe($answer(DocumentStatus::REJECTED, null, 'Neuspješna isporuka'))
+		->and($client->status('5'))->toBe($rejected(FiscalizationStatus::FISCALIZED, 'Odbijen jer iznos nije ispravan'))
+		->and($client->status('6'))->toBe($rejected(null, 'Neuspješna isporuka'))
+		// The buyer's note is the reason a rejected document keeps, though the tax authority refused it too, whose reason
+		// stays apart
+		->and($client->status('12'))->toBe($rejected(FiscalizationStatus::FAILED, 'iznos nije ispravan', 'S006 Pristupna točka nije ovlaštena za dostavu podataka'))
 		->and($client->status('7')['status'])->toBe(DocumentStatus::DELIVERED)
 		->and(fn () => $client->status('8'))->toThrow(RuntimeException::class, 'HTTP 400: Status dokumenta nije moguće dohvatiti (Dokument sa ID-em ne pripada korisniku)')
 		->and($client->status('229872'))->toBe($answer(DocumentStatus::DELIVERED, FiscalizationStatus::FAILED, 'S006 Pristupna točka nije ovlaštena za dostavu podataka'))
@@ -330,6 +341,33 @@ it('tells a service that is down from a key it refuses when the connection is te
 	expect(fn () => $client->ping())->toThrow(RuntimeException::class, 'switch on automatic fiscalization of outgoing documents');
 
 	Http::assertSentCount(6);
+});
+
+it('never says the account\'s API key, however the answer carries it', function () {
+	Http::fake([
+		'https://test.eposlovanje.hr/api/v2/document/send' => Http::sequence()
+			->push(['error' => 'Greška pri autentifikaciji korisnika', 'details' => 'Ključ 1234567890abcdef1234567890abcdef nije pronađen'], 400)
+			->push('<html><body>Unauthorized: 1234567890abcdef1234567890abcdef</body></html>', 401),
+	]);
+	$client = app(EPoslovanjeClient::class);
+
+	$messages = array_map(fn () => rescue(fn () => $client->send('<Invoice/>'), fn (Throwable $exception) => $exception->getMessage(), false), range(1, 2));
+
+	expect($messages)->toBe([
+		'HTTP 400: Greška pri autentifikaciji korisnika (Ključ [redacted] nije pronađen)',
+		'HTTP 401: <html><body>Unauthorized: [redacted]</body></html>',
+	]);
+});
+
+it('takes an answer cut off on its way for one that never came, and the service down when the connection is tested', function () {
+	Http::fake([
+		'https://test.eposlovanje.hr/api/v2/document/status/1' => answerCutOff(503, '{"error":"Service Unav'),
+		'https://test.eposlovanje.hr/api/v2/ping' => answerCutOff(502, '<title>502 Bad Gate'),
+	]);
+	$client = app(EPoslovanjeClient::class);
+
+	expect(fn () => $client->status('1'))->toThrow(RuntimeException::class, 'HTTP 503: {"error":"Service Unav')
+		->and(fn () => $client->ping())->toThrow(EInvoiceUnavailableException::class, 'HTTP 502: <title>502 Bad Gate');
 });
 
 it('asks for a document to be fiscalized again', function () {
