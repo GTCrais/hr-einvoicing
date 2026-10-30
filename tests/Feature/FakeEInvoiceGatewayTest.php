@@ -295,7 +295,7 @@ it('refuses a document only when one is sent and finds the service down only whe
 		->and($gateway->pings)->toBe(0);
 });
 
-it('leaves the tax authority\'s answers and their reasons unknown while they cannot be read, as the real clients do, keeping why a rejected document will not reach the buyer', function () {
+it('leaves the tax authority\'s answers and their reasons unknown while they cannot be read, as the real clients do, keeping why the buyer rejected a document', function () {
 	$gateway = new FakeEInvoiceGateway;
 	$delivered = $gateway->send('<Invoice><cbc:ID>1/P1/1</cbc:ID></Invoice>')['electronicId'];
 	$rejected = $gateway->send('<Invoice><cbc:ID>2/P1/1</cbc:ID></Invoice>')['electronicId'];
@@ -306,7 +306,7 @@ it('leaves the tax authority\'s answers and their reasons unknown while they can
 		->and($gateway->status($rejected))->toBe(['status' => DocumentStatus::REJECTED, 'fiscalization' => null, 'error' => 'Neuspješna dostava', 'payment' => null, 'paymentError' => null, 'paymentReports' => null, 'answersError' => 'HTTP 503: Service Unavailable', 'rejectionReason' => 'Neuspješna dostava', 'fiscalizationError' => null, 'deliveryRetriesUntil' => null, 'accepted' => false]);
 });
 
-it('keeps why a rejected document will not reach the buyer apart from why its fiscalization failed, and asked to fiscalize it again clears only the fiscalization\'s', function () {
+it('keeps why the buyer rejected a document apart from why its fiscalization failed, and asked to fiscalize it again clears only the fiscalization\'s', function () {
 	$gateway = new FakeEInvoiceGateway;
 	$rejected = $gateway->send('<Invoice><cbc:ID>1/P1/1</cbc:ID></Invoice>')['electronicId'];
 	$gateway->setStatus($rejected, DocumentStatus::REJECTED, FiscalizationStatus::FAILED, 'S006 Pristupna točka nije ovlaštena za dostavu podataka', rejectionReason: 'iznos nije ispravan');

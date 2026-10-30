@@ -202,7 +202,7 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain, ListsBusi
 	/**
 	 * What the intermediary will answer for a document from now on; with answersError, the standing alone, the tax
 	 * authority's answers not read. The error is the failed fiscalization's reason (or a refused document's); for a
-	 * REJECTED standing it is why the document will not reach the buyer, unless that is given apart as rejectionReason
+	 * REJECTED standing it is why the buyer rejected it, unless that is given apart as rejectionReason
 	 * (the buyer's note), as ePoslovanje keeps it apart from the tax authority's answer. The payment reports it holds
 	 * stay as many as were reported through it, unless a number is given.
 	 */

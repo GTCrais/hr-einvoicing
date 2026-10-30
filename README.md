@@ -354,7 +354,7 @@ It holds an app to what the real intermediaries do:
   answers both; for a `REFUSED` standing `error` is the intermediary's reason (its `fiscalizationError` null, as nothing
   was fiscalized), and for any other standing whose fiscalization failed it is that failure's `fiscalizationError`;
 - `fiscalizeAgain()` sets a failed or unanswered fiscalization back to waiting, clearing only the fiscalization's reason
-  (why a rejected document will not reach the buyer stays), and leaves a fiscalized one as it is: a fiscalization taken
+  (the buyer's reason for a rejection stays), and leaves a fiscalized one as it is: a fiscalization taken
   stays taken whatever a later request says, as ePoslovanje's standing reads;
 - `reportPayment()` takes a report and `status()` tells its answer later (`paymentAnswer`), as ePoslovanje answers;
   `refusePaymentNext($reason)` has the next report refused at once, as Moj-eRačun answers: `reportPayment()` throws a
