@@ -2,9 +2,11 @@
 
 use GTCrais\HrEInvoicing\Contracts\EInvoiceGateway;
 use GTCrais\HrEInvoicing\Contracts\FiscalizesAgain;
+use GTCrais\HrEInvoicing\Contracts\ListsBusinessUnits;
 use GTCrais\HrEInvoicing\DocumentStatus;
 use GTCrais\HrEInvoicing\Exceptions\EInvoiceRefusedException;
 use GTCrais\HrEInvoicing\Exceptions\EInvoiceUnavailableException;
+use GTCrais\HrEInvoicing\Exceptions\PaymentReportRefusedException;
 use GTCrais\HrEInvoicing\FiscalizationStatus;
 use GTCrais\HrEInvoicing\GatewayManager;
 use GTCrais\HrEInvoicing\Testing\FakeEInvoiceGateway;
@@ -21,7 +23,7 @@ it('keeps what was sent and reported, and answers with the standing a test set a
 
 	expect($sent)->toBe(['electronicId' => '1001', 'status' => DocumentStatus::SENT])
 		->and($gateway->sent)->toHaveCount(1)
-		->and($gateway->status('1001'))->toBe(['status' => DocumentStatus::DELIVERED, 'fiscalization' => FiscalizationStatus::FAILED, 'error' => 'S005 Poruka nije u skladu s XML shemom', 'payment' => FiscalizationStatus::FISCALIZED, 'paymentError' => null, 'paymentReports' => 1, 'answersError' => null, 'rejectionReason' => null, 'fiscalizationError' => 'S005 Poruka nije u skladu s XML shemom'])
+		->and($gateway->status('1001'))->toBe(['status' => DocumentStatus::DELIVERED, 'fiscalization' => FiscalizationStatus::FAILED, 'error' => 'S005 Poruka nije u skladu s XML shemom', 'payment' => FiscalizationStatus::FISCALIZED, 'paymentError' => null, 'paymentReports' => 1, 'answersError' => null, 'rejectionReason' => null, 'fiscalizationError' => 'S005 Poruka nije u skladu s XML shemom', 'deliveryRetriesUntil' => null, 'accepted' => false])
 		// One it never sent, nor was given a standing for, it does not know, as the real ones
 		->and(fn () => $gateway->status('1002'))->toThrow(RuntimeException::class, 'The intermediary does not know the document 1002.')
 		->and(fn () => $gateway->reportPayment('1002', '2026-10-22', 10.0))->toThrow(RuntimeException::class, 'The intermediary does not know the document 1002.')
@@ -109,6 +111,21 @@ it('counts the payment reports it holds of each document, one whose answer it lo
 	expect($gateway->status($first)['paymentReports'])->toBeNull();
 });
 
+it('refuses the next payment report at once when told to, as Moj-eRačun answers, still counting it, and answers the others later as paymentAnswer says', function () {
+	$gateway = new FakeEInvoiceGateway;
+	$electronicId = $gateway->send('<Invoice><cbc:ID>1/P1/1</cbc:ID></Invoice>')['electronicId'];
+	$gateway->refusePaymentNext();
+
+	expect(fn () => $gateway->reportPayment($electronicId, '2026-10-22', 125.0))->toThrow(PaymentReportRefusedException::class, 'HTTP 400: S006 Pristupna točka nije ovlaštena za dostavu podataka')
+		->and($gateway->status($electronicId))->toMatchArray(['payment' => FiscalizationStatus::FAILED, 'paymentError' => 'S006 Pristupna točka nije ovlaštena za dostavu podataka', 'paymentReports' => 1])
+		->and($gateway->payments)->toHaveCount(1);
+
+	// Made again, it is taken and answered later, the ePoslovanje way
+	$gateway->reportPayment($electronicId, '2026-10-22', 125.0);
+
+	expect($gateway->status($electronicId))->toMatchArray(['payment' => FiscalizationStatus::FISCALIZED, 'paymentError' => null, 'paymentReports' => 2]);
+});
+
 /**
  * The fake as the gateway, with an account at each intermediary on the configured services.
  */
@@ -128,9 +145,12 @@ it('is the gateway itself, and stands in for each intermediary with only what it
 
 	expect(app(EInvoiceGateway::class))->toBe($manager->fake())
 		->and($manager->driver('eposlovanje'))->toBeInstanceOf(FiscalizesAgain::class)
+		->and($manager->driver('eposlovanje'))->toBeInstanceOf(ListsBusinessUnits::class)
 		->and($manager->driver('mojeracun'))->toBeInstanceOf(FakeIntermediary::class)
 		->not->toBeInstanceOf(FiscalizesAgain::class)
+		->not->toBeInstanceOf(ListsBusinessUnits::class)
 		->and($manager->driver('fake'))->toBeInstanceOf(FiscalizesAgain::class)
+		->and($manager->driver('fake'))->toBeInstanceOf(ListsBusinessUnits::class)
 		->and(fn () => $manager->driver('fina'))->toThrow(InvalidArgumentException::class, 'Unknown e-invoice gateway [fina].');
 });
 
@@ -282,6 +302,55 @@ it('leaves the tax authority\'s answers and their reasons unknown while they can
 	$gateway->setStatus($delivered, DocumentStatus::DELIVERED, FiscalizationStatus::FAILED, 'S006 Pristupna točka nije ovlaštena za dostavu podataka', FiscalizationStatus::FAILED, 'S007 OIB iz zahtjeva nije formalno ispravan', answersError: 'HTTP 503: Service Unavailable');
 	$gateway->setStatus($rejected, DocumentStatus::REJECTED, FiscalizationStatus::FISCALIZED, 'Neuspješna dostava', answersError: 'HTTP 503: Service Unavailable');
 
-	expect($gateway->status($delivered))->toBe(['status' => DocumentStatus::DELIVERED, 'fiscalization' => null, 'error' => null, 'payment' => null, 'paymentError' => null, 'paymentReports' => null, 'answersError' => 'HTTP 503: Service Unavailable', 'rejectionReason' => null, 'fiscalizationError' => null])
-		->and($gateway->status($rejected))->toBe(['status' => DocumentStatus::REJECTED, 'fiscalization' => null, 'error' => 'Neuspješna dostava', 'payment' => null, 'paymentError' => null, 'paymentReports' => null, 'answersError' => 'HTTP 503: Service Unavailable', 'rejectionReason' => 'Neuspješna dostava', 'fiscalizationError' => null]);
+	expect($gateway->status($delivered))->toBe(['status' => DocumentStatus::DELIVERED, 'fiscalization' => null, 'error' => null, 'payment' => null, 'paymentError' => null, 'paymentReports' => null, 'answersError' => 'HTTP 503: Service Unavailable', 'rejectionReason' => null, 'fiscalizationError' => null, 'deliveryRetriesUntil' => null, 'accepted' => false])
+		->and($gateway->status($rejected))->toBe(['status' => DocumentStatus::REJECTED, 'fiscalization' => null, 'error' => 'Neuspješna dostava', 'payment' => null, 'paymentError' => null, 'paymentReports' => null, 'answersError' => 'HTTP 503: Service Unavailable', 'rejectionReason' => 'Neuspješna dostava', 'fiscalizationError' => null, 'deliveryRetriesUntil' => null, 'accepted' => false]);
+});
+
+it('keeps why a rejected document will not reach the buyer apart from why its fiscalization failed, and asked to fiscalize it again clears only the fiscalization\'s', function () {
+	$gateway = new FakeEInvoiceGateway;
+	$rejected = $gateway->send('<Invoice><cbc:ID>1/P1/1</cbc:ID></Invoice>')['electronicId'];
+	$gateway->setStatus($rejected, DocumentStatus::REJECTED, FiscalizationStatus::FAILED, 'S006 Pristupna točka nije ovlaštena za dostavu podataka', rejectionReason: 'iznos nije ispravan');
+
+	// As ePoslovanje answers such a document
+	expect($gateway->status($rejected))->toBe(['status' => DocumentStatus::REJECTED, 'fiscalization' => FiscalizationStatus::FAILED, 'error' => 'iznos nije ispravan', 'payment' => null, 'paymentError' => null, 'paymentReports' => 0, 'answersError' => null, 'rejectionReason' => 'iznos nije ispravan', 'fiscalizationError' => 'S006 Pristupna točka nije ovlaštena za dostavu podataka', 'deliveryRetriesUntil' => null, 'accepted' => false]);
+
+	$gateway->fiscalizeAgain($rejected);
+
+	expect($gateway->status($rejected))->toMatchArray(['fiscalization' => FiscalizationStatus::WAITING, 'error' => 'iznos nije ispravan', 'rejectionReason' => 'iznos nije ispravan', 'fiscalizationError' => null, 'deliveryRetriesUntil' => null, 'accepted' => false]);
+
+	// Given its error alone, as before, a rejected standing takes it for the rejection's reason, which fiscalizing
+	// again keeps too
+	$gateway->setStatus($rejected, DocumentStatus::REJECTED, FiscalizationStatus::FAILED, 'Neuspješna dostava');
+	$gateway->fiscalizeAgain($rejected);
+
+	expect($gateway->status($rejected))->toMatchArray(['fiscalization' => FiscalizationStatus::WAITING, 'error' => 'Neuspješna dostava', 'rejectionReason' => 'Neuspješna dostava', 'fiscalizationError' => null, 'deliveryRetriesUntil' => null, 'accepted' => false]);
+});
+
+it('answers a delivery tried again, holds an undelivered document until a test deletes it, and lists the business units a test gave', function () {
+	$gateway = new FakeEInvoiceGateway;
+	$xml = '<Invoice><cbc:ID>7/P1/1</cbc:ID><cbc:IssueDate>2026-10-30</cbc:IssueDate></Invoice>';
+	$first = $gateway->send($xml)['electronicId'];
+
+	$gateway->setStatus($first, DocumentStatus::SENT, deliveryRetriesUntil: '2026-11-06T09:00:00+01:00');
+
+	expect($gateway->status($first))->toMatchArray(['status' => DocumentStatus::SENT, 'deliveryRetriesUntil' => '2026-11-06T09:00:00+01:00', 'accepted' => false]);
+
+	// Undelivered: held, so the same number is refused until the document is deleted at the intermediary
+	$gateway->setStatus($first, DocumentStatus::UNDELIVERED, error: 'Neuspješna isporuka');
+
+	expect($gateway->status($first))->toMatchArray(['status' => DocumentStatus::UNDELIVERED, 'error' => 'Neuspješna isporuka', 'deliveryRetriesUntil' => null])
+		->and($gateway->sentDocument('7/P1/1', Carbon::now()->subMinute()))->toBe(['electronicId' => $first, 'status' => DocumentStatus::UNDELIVERED])
+		->and(fn () => $gateway->send($xml))->toThrow(EInvoiceRefusedException::class, 'already exists');
+
+	$gateway->deleteDocument($first);
+
+	expect($gateway->sentDocument('7/P1/1', Carbon::now()->subMinute()))->toBeNull()
+		->and($gateway->send($xml)['electronicId'])->not->toBe($first);
+
+	$gateway->setStatus($first, DocumentStatus::DELIVERED, accepted: true);
+	$gateway->businessUnits = ['69693144506' => [['name' => 'Podružnica Senj', 'code' => '1200']]];
+
+	expect($gateway->status($first)['accepted'])->toBeTrue()
+		->and($gateway->businessUnits('69693144506'))->toBe([['name' => 'Podružnica Senj', 'code' => '1200']])
+		->and($gateway->businessUnits('12345678903'))->toBe([]);
 });

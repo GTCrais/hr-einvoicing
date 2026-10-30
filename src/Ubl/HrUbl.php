@@ -2,6 +2,8 @@
 
 namespace GTCrais\HrEInvoicing\Ubl;
 
+use InvalidArgumentException;
+
 /**
  * What the tax authority's specification fixes for every Croatian e-invoice: UBL 2.1 in the EN 16931 standard with
  * the Croatian CIUS and extension of 2025, the document types and business processes, and how the parties and the
@@ -47,6 +49,38 @@ class HrUbl
 	/** The OIB as an endpoint and party identifier scheme */
 	public const string OIB_SCHEME = '9934';
 
+	/** The scheme of a business unit's own code after the OIB ("9934:OIB::HR99:code", the HR CIUS's BT-46 of a buyer addressed by business unit) */
+	public const string BUSINESS_UNIT_SCHEME = 'HR99';
+
 	/** Pieces, the unit every line is counted in */
 	public const string UNIT = 'H87';
+
+	/**
+	 * What an issuer in the VAT system that pays VAT on what it was paid ("postupak oporezivanja prema naplaćenim
+	 * naknadama") states on every invoice, as the law has it, and so in the Croatian extension (HR-BT-15)
+	 */
+	public const string CASH_BASIS_NOTE = 'Obračun prema naplaćenim naknadama';
+
+	/**
+	 * A business unit's own code, from the code alone or the whole address an intermediary or the AMS gives
+	 * ("9934:12345678903::HR99:1200" for the company of that OIB is 1200); '' for none. An InvalidArgumentException for
+	 * a code with a space or a colon in it, or the address of another company.
+	 */
+	public static function businessUnitCode(string $value, string $oib): string
+	{
+		$value = trim($value);
+		$prefix = self::OIB_SCHEME . ':' . $oib . '::' . self::BUSINESS_UNIT_SCHEME . ':';
+
+		if (str_starts_with($value, $prefix)) {
+			$value = substr($value, strlen($prefix));
+		} elseif (str_contains($value, '::' . self::BUSINESS_UNIT_SCHEME . ':')) {
+			throw new InvalidArgumentException('The business unit ' . $value . ' is not one of the company ' . $oib . '.');
+		}
+
+		if ($value !== '' && preg_match('/[\s:]/u', $value)) {
+			throw new InvalidArgumentException('A business unit\'s code has no space or colon in it: ' . $value . '.');
+		}
+
+		return $value;
+	}
 }

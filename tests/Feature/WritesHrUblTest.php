@@ -175,6 +175,22 @@ it('leaves the Croatian extension out when every line is at a standard rate', fu
 		->and(exampleXpath($xml)->evaluate('count(//hrextac:HRFISK20Data)'))->toBe(0.0);
 });
 
+it('states an issuer\'s cash-basis VAT first in the Croatian extension, at standard rates too, and never for an issuer outside the VAT system', function () {
+	$xml = (new ExampleInvoiceBuilder)->build(exampleInvoice(['cashBasis' => true, 'lines' => [
+		['name' => 'Krema za sunčanje', 'quantity' => 1, 'net' => 20.0, 'tax' => 5.0, 'kpd' => '20.42.19', 'category' => standardRate(25.0)],
+	]]));
+	$xpath = exampleXpath($xml);
+	$outside = (new ExampleInvoiceBuilder)->build(exampleInvoice(['cashBasis' => true, 'vatRegistered' => false, 'lines' => [
+		['name' => 'Sistematski pregled', 'quantity' => 1, 'net' => 80.0, 'tax' => 0.0, 'kpd' => '86.22.19', 'category' => outsideVat('Obveznik nije u sustavu PDV-a')],
+	]]));
+
+	expect(UblSchema::errors($xml))->toBe([])
+		->and($xpath->evaluate('string(//hrextac:HRFISK20Data/*[1][self::hrextac:HRObracunPDVPoNaplati])'))->toBe(HrUbl::CASH_BASIS_NOTE)
+		->and($xpath->evaluate('string(//hrextac:HRFISK20Data/hrextac:HRTaxTotal/cbc:TaxAmount)'))->toBe('5.00')
+		->and(UblSchema::errors($outside))->toBe([])
+		->and(exampleXpath($outside)->evaluate('count(//hrextac:HRObracunPDVPoNaplati)'))->toBe(0.0);
+});
+
 it('writes a storno that points back at the invoice, and an advance with what was paid before', function () {
 	$storno = (new ExampleInvoiceBuilder)->build(exampleInvoice([
 		'type' => HrUbl::TYPE_CORRECTIVE,
@@ -252,13 +268,12 @@ it('writes text as XML 1.0 takes it, a pasted line break as a space and every ch
 		->and(collect(iterator_to_array($xpath->query('//*[not(node())]')))->map->localName->all())->toBe(['SignatureInformation']);
 });
 
-it('leaves out a part none of whose elements was written, and a reference without the number it refers by, so the document holds to the schema', function () {
+it('leaves out a part none of whose elements was written, and a reference without the number it refers by, so the document holds to the schema, but refuses a payment by transfer without the IBAN it is paid to', function () {
 	$xml = (new ExampleInvoiceBuilder)->build(exampleInvoice([
 		'refersTo' => ['number' => ' ', 'issueDate' => '2026-10-23'],
 		'operatorOib' => '',
 		'operator' => '',
 		'deliveredOn' => '',
-		'iban' => ' ',
 		'lines' => [
 			['name' => 'Krema za sunčanje', 'quantity' => 1, 'net' => 20.0, 'tax' => 5.0, 'kpd' => '', 'category' => standardRate(25.0)],
 		],
@@ -269,14 +284,36 @@ it('leaves out a part none of whose elements was written, and a reference withou
 		->and($xpath->evaluate('count(//cac:BillingReference)'))->toBe(0.0)
 		->and($xpath->evaluate('count(//cac:SellerContact)'))->toBe(0.0)
 		->and($xpath->evaluate('count(//cac:Delivery)'))->toBe(0.0)
-		->and($xpath->evaluate('count(//cac:PayeeFinancialAccount)'))->toBe(0.0)
 		->and($xpath->evaluate('count(//cac:CommodityClassification)'))->toBe(0.0)
 		// What was written of a part stays
-		->and($xpath->evaluate('string(/inv:Invoice/cac:PaymentMeans/cbc:PaymentID)'))->toBe('17/P1/1')
-		->and(collect(iterator_to_array($xpath->query('//*[not(node())]')))->map->localName->all())->toBe(['SignatureInformation']);
+		->and($xpath->evaluate('count(/inv:Invoice/cac:AccountingSupplierParty/cac:Party)'))->toBe(1.0)
+		->and(collect(iterator_to_array($xpath->query('//*[not(node())]')))->map->localName->all())->toBe(['SignatureInformation'])
+		// A credit transfer (code 30) names the account it is paid to
+		->and(fn () => (new ExampleInvoiceBuilder)->build(exampleInvoice(['iban' => " \t "])))->toThrow(InvalidArgumentException::class, 'EN 16931 BR-61');
 });
 
 it('says what the schema has against a document that breaks it', function () {
 	expect(UblSchema::errors('<Invoice xmlns="' . HrUbl::NAMESPACES[''] . '"/>'))->not->toBe([])
 		->and(UblSchema::errors('<CreditNote xmlns="' . HrUbl::CREDIT_NOTE_NAMESPACE . '"><Unknown/></CreditNote>'))->not->toBe([]);
+});
+
+it('names a buyer that receives e-invoices by business unit by its unit\'s code beside its OIB, the endpoint staying the OIB, as the HR CIUS\'s example has it', function () {
+	$customer = exampleInvoice()['customer'];
+	$identifier = fn (array $party) => exampleXpath((new ExampleInvoiceBuilder)->build(exampleInvoice(['customer' => $party])))->evaluate('string(/inv:Invoice/cac:AccountingCustomerParty/cac:Party/cac:PartyIdentification/cbc:ID)');
+	$xml = (new ExampleInvoiceBuilder)->build(exampleInvoice(['customer' => [...$customer, 'businessUnit' => '1200']]));
+	$xpath = exampleXpath($xml);
+
+	expect(UblSchema::errors($xml))->toBe([])
+		->and($xpath->evaluate('string(/inv:Invoice/cac:AccountingCustomerParty/cac:Party/cac:PartyIdentification/cbc:ID)'))->toBe('9934:98765432106::HR99:1200')
+		->and($xpath->evaluate('string(/inv:Invoice/cac:AccountingCustomerParty/cac:Party/cbc:EndpointID)'))->toBe('98765432106')
+		// The whole address as an intermediary lists it, blanks around it, or none at all
+		->and($identifier([...$customer, 'businessUnit' => ' 9934:98765432106::HR99:1200 ']))->toBe('9934:98765432106::HR99:1200')
+		->and($identifier([...$customer, 'businessUnit' => null]))->toBe('9934:98765432106')
+		->and($identifier([...$customer, 'businessUnit' => '']))->toBe('9934:98765432106')
+		->and(HrUbl::businessUnitCode('9934:98765432106::HR99:1200', '98765432106'))->toBe('1200');
+
+	// Never another company's unit, nor a code that would break the address
+	expect(fn () => $identifier([...$customer, 'businessUnit' => '9934:12345678903::HR99:1200']))->toThrow(InvalidArgumentException::class, 'is not one of the company 98765432106')
+		->and(fn () => $identifier([...$customer, 'businessUnit' => 'PJ 12']))->toThrow(InvalidArgumentException::class, 'no space or colon')
+		->and(fn () => $identifier([...$customer, 'businessUnit' => 'HR99:12']))->toThrow(InvalidArgumentException::class, 'no space or colon');
 });

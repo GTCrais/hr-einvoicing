@@ -6,9 +6,11 @@ use Carbon\CarbonImmutable;
 use DateTimeInterface;
 use GTCrais\HrEInvoicing\Contracts\EInvoiceGateway;
 use GTCrais\HrEInvoicing\Contracts\FiscalizesAgain;
+use GTCrais\HrEInvoicing\Contracts\ListsBusinessUnits;
 use GTCrais\HrEInvoicing\DocumentStatus;
 use GTCrais\HrEInvoicing\Exceptions\EInvoiceRefusedException;
 use GTCrais\HrEInvoicing\Exceptions\EInvoiceUnavailableException;
+use GTCrais\HrEInvoicing\Exceptions\PaymentReportRefusedException;
 use GTCrais\HrEInvoicing\FiscalizationStatus;
 use RuntimeException;
 
@@ -16,10 +18,13 @@ use RuntimeException;
  * Answers in place of the intermediary: an identifier for every e-invoice sent, the standing a test set for it, and a
  * record of the payments reported, with the tax authority's answer to them and how many it holds of each document;
  * told to fail the next few calls, it does (a refusal of the document only when one is sent, the service down only when
- * the connection is tested, as the real clients throw them), and told to lose the next answer, it keeps the document
- * (or the payment report) and fails as a timeout would, and can keep such a document out of the next lookups, as an
+ * the connection is tested, as the real clients throw them); told to refuse the next payment report, it refuses it at
+ * once, as Moj-eRačun does, and still counts it; and told to lose the next answer, it keeps the document (or the
+ * payment report) and fails as a timeout would, and can keep such a document out of the next lookups, as an
  * intermediary whose lists do not show it yet. Like the real ones, it refuses a document of a number it holds already
- * for the year, unless the one it holds was refused. When
+ * for the year, unless the one it holds was refused, an undelivered one included until a test deletes it
+ * (deleteDocument(), as ePoslovanje's user deletes one in its web application); and it lists the business units a test
+ * gave a company (businessUnits). When
  * config('hrEInvoicing.gateway') is "fake" it is the gateway, one for the whole run, and GatewayManager hands it out
  * for every intermediary and service as a FakeIntermediary, which can do what that intermediary's real client can,
  * needs an account there as the client does, and makes its calls through this fake as that intermediary on that
@@ -28,7 +33,7 @@ use RuntimeException;
  * others' documents. Asked directly, as a test does, it stands for none and finds every document. A test resets it
  * before it starts and reads what was sent.
  */
-class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain
+class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain, ListsBusinessUnits
 {
 	/** @var list<string> */
 	public array $sent = [];
@@ -46,8 +51,11 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain
 
 	public bool $ready = true;
 
-	/** @var array<string, array{status: DocumentStatus, fiscalization: ?FiscalizationStatus, error: ?string, payment: ?FiscalizationStatus, paymentError: ?string, paymentReports: int, answersError: ?string}> */
+	/** Each document's standing: error is its failed fiscalization's reason (or a refused or undelivered one's), rejectionReason why the buyer rejected it, deliveryRetriesUntil until when a failed delivery is tried again, accepted whether the buyer approved or paid it @var array<string, array{status: DocumentStatus, fiscalization: ?FiscalizationStatus, error: ?string, payment: ?FiscalizationStatus, paymentError: ?string, paymentReports: int, answersError: ?string, rejectionReason: ?string, deliveryRetriesUntil: ?string, accepted: bool}> */
 	public array $statuses = [];
+
+	/** The business units of each company, by its OIB, as businessUnits() lists them @var array<string, list<array{name: string, code: string}>> */
+	public array $businessUnits = [];
 
 	/** The standing a freshly sent document gets */
 	public DocumentStatus $sendStatus = DocumentStatus::SENT;
@@ -63,6 +71,9 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain
 
 	/** The failures a test told it to come, each with the calls it fails (null: any) @var list<array{exception: RuntimeException, methods: ?list<string>}> */
 	protected array $failures = [];
+
+	/** The payment reports the tax authority is to refuse at once, as Moj-eRačun answers them, each with its reason @var list<string> */
+	protected array $paymentRefusals = [];
 
 	/** The lookups the next document whose answer is lost is kept out of */
 	protected int $lookupsToHide = 0;
@@ -97,11 +108,13 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain
 		$this->pings = 0;
 		$this->ready = true;
 		$this->statuses = [];
+		$this->businessUnits = [];
 		$this->sendStatus = DocumentStatus::SENT;
 		$this->paymentAnswer = FiscalizationStatus::FISCALIZED;
 		$this->answersToLose = 0;
 		$this->paymentAnswersToLose = 0;
 		$this->failures = [];
+		$this->paymentRefusals = [];
 		$this->lookupsToHide = 0;
 		$this->hiddenFromLookups = [];
 		$this->intermediary = null;
@@ -141,8 +154,8 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain
 	}
 
 	/**
-	 * Fail the next connection test (ping()) as the intermediary does while its service is down, before it looks at the
-	 * account; only the real clients' ping() throws it.
+	 * Fail the next connection test (ping()) as the intermediary does while its service is down, so the account is never
+	 * tried; only the real clients' ping() throws it.
 	 */
 	public function unavailableNext(string $error = 'HTTP 500'): void
 	{
@@ -176,16 +189,53 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain
 	}
 
 	/**
-	 * What the intermediary will answer for a document from now on; with answersError, the standing alone, the tax
-	 * authority's answers not read. The payment reports it holds stay as many as were reported through it, unless a
-	 * number is given.
+	 * Have the tax authority refuse the next payment report at once, as Moj-eRačun answers one: reportPayment() throws
+	 * the refusal ("HTTP 400: " and the reason), and the report still counts among those the intermediary holds
+	 * (paymentReports), its answer failed with the reason (payment, paymentError), as Moj-eRačun's status() then reads
+	 * it. A report not refused so is answered as paymentAnswer says, later in status(), as ePoslovanje answers.
 	 */
-	public function setStatus(string $electronicId, DocumentStatus $status, ?FiscalizationStatus $fiscalization = null, ?string $error = null, ?FiscalizationStatus $payment = null, ?string $paymentError = null, ?string $answersError = null, ?int $paymentReports = null): void
+	public function refusePaymentNext(string $reason = 'S006 Pristupna točka nije ovlaštena za dostavu podataka'): void
 	{
+		$this->paymentRefusals[] = $reason;
+	}
+
+	/**
+	 * What the intermediary will answer for a document from now on; with answersError, the standing alone, the tax
+	 * authority's answers not read. The error is the failed fiscalization's reason (or a refused document's); for a
+	 * REJECTED standing it is why the document will not reach the buyer, unless that is given apart as rejectionReason
+	 * (the buyer's note), as ePoslovanje keeps it apart from the tax authority's answer. The payment reports it holds
+	 * stay as many as were reported through it, unless a number is given.
+	 */
+	public function setStatus(string $electronicId, DocumentStatus $status, ?FiscalizationStatus $fiscalization = null, ?string $error = null, ?FiscalizationStatus $payment = null, ?string $paymentError = null, ?string $answersError = null, ?int $paymentReports = null, ?string $rejectionReason = null, ?string $deliveryRetriesUntil = null, bool $accepted = false): void
+	{
+		$rejected = $status === DocumentStatus::REJECTED;
+		// A REJECTED standing given no rejectionReason takes its error for it, as before the two were kept apart
+		$errorIsRejection = $rejected && $rejectionReason === null;
+
 		$this->statuses[$electronicId] = [
-			'status' => $status, 'fiscalization' => $fiscalization, 'error' => $error, 'payment' => $payment, 'paymentError' => $paymentError,
+			'status' => $status, 'fiscalization' => $fiscalization, 'error' => $errorIsRejection ? null : $error, 'payment' => $payment, 'paymentError' => $paymentError,
 			'paymentReports' => $paymentReports ?? $this->statuses[$electronicId]['paymentReports'] ?? $this->reportsOf($electronicId), 'answersError' => $answersError,
+			'rejectionReason' => $rejected ? ($rejectionReason ?? $error) : null,
+			'deliveryRetriesUntil' => $status === DocumentStatus::SENT ? $deliveryRetriesUntil : null, 'accepted' => $accepted,
 		];
+	}
+
+	/**
+	 * Delete a document the intermediary holds, as ePoslovanje's user deletes an undelivered one in its web application:
+	 * it is found no more, and its number may go again.
+	 */
+	public function deleteDocument(string $electronicId): void
+	{
+		$this->statuses[$electronicId] = [...($this->statuses[$electronicId] ?? []), 'status' => DocumentStatus::REFUSED];
+		$this->hiddenFromLookups[$electronicId] = PHP_INT_MAX;
+	}
+
+	public function businessUnits(string $oib): array
+	{
+		$this->record('businessUnits', null);
+		$this->refuseIfAsked('businessUnits');
+
+		return $this->businessUnits[$oib] ?? [];
 	}
 
 	public function ready(): bool
@@ -204,7 +254,7 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain
 
 		$electronicId = (string) (1000 + count($this->sent));
 
-		$this->statuses[$electronicId] = ['status' => $this->sendStatus, 'fiscalization' => null, 'error' => null, 'payment' => null, 'paymentError' => null, 'paymentReports' => 0, 'answersError' => null];
+		$this->statuses[$electronicId] = ['status' => $this->sendStatus, 'fiscalization' => null, 'error' => null, 'payment' => null, 'paymentError' => null, 'paymentReports' => 0, 'answersError' => null, 'rejectionReason' => null, 'deliveryRetriesUntil' => null, 'accepted' => false];
 		// An identifier given out again, after a test emptied sent, is a new document
 		unset($this->hiddenFromLookups[$electronicId]);
 
@@ -262,8 +312,8 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain
 	/**
 	 * The standing a test set, or the one the document was sent with. The reason in `error` is the rejection's for a
 	 * rejected document (`rejectionReason`), else the tax authority's about its fiscalization (`fiscalizationError`)
-	 * when it failed. With answersError, the tax authority's answers are unknown, as the real clients leave them:
-	 * fiscalization, payment, their reasons and the payment reports held.
+	 * when it failed, which a rejected document answers apart. With answersError, the tax authority's answers are
+	 * unknown, as the real clients leave them: fiscalization, payment, their reasons and the payment reports held.
 	 */
 	public function status(string $electronicId): array
 	{
@@ -272,22 +322,27 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain
 		$this->knowOrRefuse($electronicId);
 
 		$answer = $this->statuses[$electronicId];
-		$rejectionReason = $answer['status'] === DocumentStatus::REJECTED ? $answer['error'] : null;
+		$rejectionReason = $answer['status'] === DocumentStatus::REJECTED ? ($answer['rejectionReason'] ?? null) : null;
 
 		if ($answer['answersError'] !== null) {
 			return [
 				'status' => $answer['status'], 'fiscalization' => null, 'error' => $rejectionReason, 'payment' => null, 'paymentError' => null, 'paymentReports' => null, 'answersError' => $answer['answersError'],
-				'rejectionReason' => $rejectionReason, 'fiscalizationError' => null,
+				'rejectionReason' => $rejectionReason, 'fiscalizationError' => null, 'deliveryRetriesUntil' => $answer['deliveryRetriesUntil'] ?? null, 'accepted' => $answer['accepted'] ?? false,
 			];
 		}
 
 		return [
-			'status' => $answer['status'], 'fiscalization' => $answer['fiscalization'], 'error' => $answer['error'], 'payment' => $answer['payment'], 'paymentError' => $answer['paymentError'],
+			'status' => $answer['status'], 'fiscalization' => $answer['fiscalization'], 'error' => $rejectionReason ?? $answer['error'], 'payment' => $answer['payment'], 'paymentError' => $answer['paymentError'],
 			'paymentReports' => $answer['paymentReports'], 'answersError' => null,
-			'rejectionReason' => $rejectionReason, 'fiscalizationError' => $rejectionReason === null && $answer['fiscalization'] === FiscalizationStatus::FAILED ? $answer['error'] : null,
+			'rejectionReason' => $rejectionReason, 'fiscalizationError' => $answer['fiscalization'] === FiscalizationStatus::FAILED ? $answer['error'] : null,
+			'deliveryRetriesUntil' => $answer['deliveryRetriesUntil'] ?? null, 'accepted' => $answer['accepted'] ?? false,
 		];
 	}
 
+	/**
+	 * Takes the report and answers it as paymentAnswer says, later in status(), as ePoslovanje answers; one a test had
+	 * refused (refusePaymentNext()) is refused at once, as Moj-eRačun answers, and still counts among the reports held.
+	 */
 	public function reportPayment(string $electronicId, string $paidOn, float $amount): void
 	{
 		$this->record('reportPayment', $electronicId);
@@ -295,10 +350,11 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain
 		$this->knowOrRefuse($electronicId);
 
 		$this->payments[] = ['electronicId' => $electronicId, 'paidOn' => $paidOn, 'amount' => $amount, 'intermediary' => $this->intermediary, 'environment' => $this->environment];
+		$refusal = array_shift($this->paymentRefusals);
 
 		if (isset($this->statuses[$electronicId])) {
-			$this->statuses[$electronicId]['payment'] = $this->paymentAnswer;
-			$this->statuses[$electronicId]['paymentError'] = null;
+			$this->statuses[$electronicId]['payment'] = $refusal === null ? $this->paymentAnswer : FiscalizationStatus::FAILED;
+			$this->statuses[$electronicId]['paymentError'] = $refusal;
 			$this->statuses[$electronicId]['paymentReports']++;
 		}
 
@@ -307,11 +363,17 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain
 
 			throw new RuntimeException('cURL error 28: Operation timed out after 15001 milliseconds');
 		}
+
+		if ($refusal !== null) {
+			throw new PaymentReportRefusedException('HTTP 400: ' . $refusal);
+		}
 	}
 
 	/**
-	 * Asked to fiscalize again, it waits for the tax authority's answer once more, unless the document is fiscalized
-	 * already: as ePoslovanje's status() reads it, a fiscalization taken stays taken whatever a later request says.
+	 * Asked to fiscalize again, it waits for the tax authority's answer once more, the failed fiscalization's reason
+	 * cleared and a rejection's kept, as ePoslovanje keeps the buyer's note whatever a new request does; unless the
+	 * document is fiscalized already: as ePoslovanje's status() reads it, a fiscalization taken stays taken whatever a
+	 * later request says.
 	 */
 	public function fiscalizeAgain(string $electronicId): void
 	{

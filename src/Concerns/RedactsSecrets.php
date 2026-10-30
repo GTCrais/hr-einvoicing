@@ -36,7 +36,8 @@ trait RedactsSecrets
 
 	/**
 	 * The start of an answer's body, for a message when nothing in the answer says why: its JSON escapes read (a .NET
-	 * service writes "+" and every letter outside ASCII as \uXXXX), the secrets left out, at most 300 characters.
+	 * service writes "+" and every letter outside ASCII as \uXXXX) and its HTML character references too (ASP.NET Core's
+	 * pages write "+" and every letter outside ASCII as &#x2B; and the like), the secrets left out, at most 300 characters.
 	 *
 	 * @param  list<mixed>  $secrets
 	 */
@@ -47,6 +48,7 @@ trait RedactsSecrets
 			fn (array $escapes) => is_string($read = json_decode('"' . $escapes[0] . '"')) ? $read : $escapes[0],
 			$body
 		);
+		$text = html_entity_decode($text, ENT_QUOTES | ENT_HTML5, 'UTF-8');
 
 		return mb_substr($this->redact(trim($text), $secrets), 0, 300);
 	}

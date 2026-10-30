@@ -48,15 +48,19 @@ interface EInvoiceGateway
 	 * intermediary holds (paymentReports: every one it took, those the tax authority refused included), which tells a
 	 * caller that reports more than one payment of a document (a payment taken back with a negative one, then reported
 	 * again) whether a report whose answer was lost reached it. The reasons are null where the intermediary gave none.
-	 * The reason in error is the one to keep for the standing: for a document that will not reach the buyer (REJECTED),
-	 * why not when the intermediary says (rejectionReason: the buyer's note, or the failed delivery's words), else the
-	 * tax authority's about its fiscalization, which fiscalizationError holds whatever the standing (for a REFUSED
-	 * document, the intermediary's reason instead, and fiscalizationError null, as the tax authority never saw it).
-	 * When the standing is known but the tax authority's answers could not be read, answersError says why, and
-	 * fiscalization, payment, their reasons and paymentReports are then unknown rather than none: a caller never takes
-	 * a null payment for a report never made unless answersError is null.
+	 * The reason in error is the one to keep for the standing: for a document the buyer rejected (REJECTED), the buyer's
+	 * note when the intermediary passes it on (rejectionReason), for one that could not be delivered (UNDELIVERED) the
+	 * intermediary's words about the delivery, else the tax authority's about its fiscalization, which
+	 * fiscalizationError holds whatever the standing (for a REFUSED or an UNDELIVERED document, the intermediary's
+	 * reason instead, and fiscalizationError null, as the tax authority never saw it). A document being delivered again
+	 * after a failed delivery is SENT, with deliveryRetriesUntil the moment (ISO 8601) until which the intermediary
+	 * keeps trying, null otherwise. accepted says the buyer approved or paid it, after which no rejection comes; false
+	 * while the buyer has said neither, or the intermediary cannot tell. When the standing is known but the tax
+	 * authority's answers could not be read, answersError says why, and fiscalization, payment, their reasons and
+	 * paymentReports are then unknown rather than none: a caller never takes a null payment for a report never made
+	 * unless answersError is null.
 	 *
-	 * @return array{status: DocumentStatus, fiscalization: ?FiscalizationStatus, error: ?string, payment: ?FiscalizationStatus, paymentError: ?string, paymentReports: ?int, answersError: ?string, rejectionReason: ?string, fiscalizationError: ?string}
+	 * @return array{status: DocumentStatus, fiscalization: ?FiscalizationStatus, error: ?string, payment: ?FiscalizationStatus, paymentError: ?string, paymentReports: ?int, answersError: ?string, rejectionReason: ?string, fiscalizationError: ?string, deliveryRetriesUntil: ?string, accepted: bool}
 	 */
 	public function status(string $electronicId): array;
 

@@ -4,10 +4,12 @@ namespace GTCrais\HrEInvoicing;
 
 use GTCrais\HrEInvoicing\Contracts\EInvoiceGateway;
 use GTCrais\HrEInvoicing\Contracts\FiscalizesAgain;
+use GTCrais\HrEInvoicing\Contracts\ListsBusinessUnits;
 use GTCrais\HrEInvoicing\EPoslovanje\Contracts\AccountProvider as EPoslovanjeAccountProvider;
 use GTCrais\HrEInvoicing\EPoslovanje\EPoslovanjeClient;
 use GTCrais\HrEInvoicing\MojEracun\Contracts\AccountProvider as MojEracunAccountProvider;
 use GTCrais\HrEInvoicing\MojEracun\MojEracunClient;
+use GTCrais\HrEInvoicing\Testing\FakeBusinessUnitsIntermediary;
 use GTCrais\HrEInvoicing\Testing\FakeEInvoiceGateway;
 use GTCrais\HrEInvoicing\Testing\FakeFiscalizingIntermediary;
 use GTCrais\HrEInvoicing\Testing\FakeIntermediary;
@@ -81,8 +83,9 @@ class GatewayManager
 	}
 
 	/**
-	 * The fake as the named intermediary, with the account provider and the configured service of its real client and
-	 * fiscalizeAgain() only where that client takes it; the fake's own name can do everything and is always set up, and
+	 * The fake as the named intermediary, with the account provider and the configured service of its real client,
+	 * fiscalizeAgain() only where that client takes it and businessUnits() only where it also lists them (ePoslovanje);
+	 * the fake's own name can do everything and is always set up, and
 	 * a name the package does not know is refused, as the real manager refuses it.
 	 */
 	protected function fakeFor(string $name, ?string $environment): FakeIntermediary
@@ -94,7 +97,13 @@ class GatewayManager
 			default => throw new InvalidArgumentException("Unknown e-invoice gateway [{$name}]."),
 		};
 
-		$class = $client === null || is_a($client, FiscalizesAgain::class, true) ? FakeFiscalizingIntermediary::class : FakeIntermediary::class;
+		$fiscalizes = $client === null || is_a($client, FiscalizesAgain::class, true);
+		$lists = $client === null || is_a($client, ListsBusinessUnits::class, true);
+		$class = match (true) {
+			$fiscalizes && $lists => FakeBusinessUnitsIntermediary::class,
+			$fiscalizes => FakeFiscalizingIntermediary::class,
+			default => FakeIntermediary::class,
+		};
 
 		$intermediary = new $class(
 			$this->fake(),

@@ -8,16 +8,20 @@ use GTCrais\HrEInvoicing\Concerns\ChoosesEnvironment;
 use GTCrais\HrEInvoicing\Concerns\RedactsSecrets;
 use GTCrais\HrEInvoicing\Contracts\EInvoiceGateway;
 use GTCrais\HrEInvoicing\Contracts\FiscalizesAgain;
+use GTCrais\HrEInvoicing\Contracts\ListsBusinessUnits;
 use GTCrais\HrEInvoicing\DocumentStatus;
 use GTCrais\HrEInvoicing\EPoslovanje\Contracts\AccountProvider;
 use GTCrais\HrEInvoicing\Exceptions\EInvoiceRefusedException;
 use GTCrais\HrEInvoicing\Exceptions\EInvoiceUnavailableException;
+use GTCrais\HrEInvoicing\Exceptions\PaymentReportRefusedException;
 use GTCrais\HrEInvoicing\FiscalizationStatus;
+use GTCrais\HrEInvoicing\Ubl\HrUbl;
 use Illuminate\Http\Client\HttpClientException;
 use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Http\Client\RequestException;
 use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\Http;
+use InvalidArgumentException;
 use RuntimeException;
 
 /**
@@ -26,14 +30,18 @@ use RuntimeException;
  * goes as the XML text of a JSON request with the software identifier, and ePoslovanje validates it, signs it,
  * reports it to the tax authority when the account has outgoing fiscalization switched on, and queues it for the
  * buyer's intermediary. A document's answer names its standing with one of ePoslovanje's codes (1 waiting, 2 being
- * sent, 3 sent, 4 delivered, 5 approved, 6 rejected by the buyer, 7 paid, 8 partly paid, 9 delivery failed, which is
- * read as rejected until ePoslovanje confirms what it means for the document) and lists its eReporting requests: the
+ * sent, 3 sent, 4 delivered, 5 approved, 6 rejected by the buyer, 7 paid, 8 partly paid, 9 delivery failed) and lists
+ * its eReporting requests. A failed delivery is no final word (ePoslovanje, 2026-10-30): it tries again, mostly within
+ * the week after it took the document, so the document is SENT meanwhile, with the moment it gives up
+ * (deliveryRetriesUntil), and UNDELIVERED after it; it is fiscalized only once delivered, so an undelivered one needs
+ * no storno: deleted in ePoslovanje's web application (its API has no call for it), it goes again corrected under its
+ * number, never as a copy, which could not be fiscalized without the original. The eReporting requests: the
  * first kind is the document's own fiscalization, the fourth a report of its payment, each answered by the tax
  * authority later (`success`, its `errorCode` and `errorDescription`; a refused request is stamped `completedOn` too).
  * The environment is "demo" (the test server) or "production", and a call may take attemptSeconds; the service provider
  * builds it from config('hrEInvoicing'). A failure's message never carries the account's API key.
  */
-class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain
+class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain, ListsBusinessUnits
 {
 	use ChoosesEnvironment;
 	use RedactsSecrets;
@@ -56,8 +64,20 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain
 	/** ePoslovanje's codes of a document the buyer has */
 	protected const array DELIVERED_CODES = [4, 5, 7, 8];
 
-	/** ePoslovanje's codes of a document that will not reach the buyer */
-	protected const array REJECTED_CODES = [6, 9];
+	/** ePoslovanje's codes of a document the buyer approved or paid, after which no rejection comes */
+	protected const array ACCEPTED_CODES = [5, 7, 8];
+
+	/** ePoslovanje's code of a document the buyer rejected */
+	protected const int REJECTED_CODE = 6;
+
+	/** ePoslovanje's code of a document whose delivery to the buyer's intermediary failed */
+	protected const int DELIVERY_FAILED_CODE = 9;
+
+	/**
+	 * The days after ePoslovanje took a document within which it tries again to deliver it, after which a failed
+	 * delivery is taken for final (ePoslovanje, 2026-10-30: mostly within the next seven days)
+	 */
+	public const int DELIVERY_RETRY_DAYS = 7;
 
 	/** The most outgoing documents one listing answers with */
 	protected const int PAGE_SIZE = 1000;
@@ -171,9 +191,11 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain
 		[$fiscalization, $fiscalizationError] = $this->outcome($document, self::FISCALIZATION_REQUEST, anySuccess: true);
 		[$payment, $paymentError] = $this->outcome($document, self::PAYMENT_REQUEST, anySuccess: false);
 
-		// Why one that will not reach the buyer will not (the buyer's note, or the failed delivery's words) is the reason
-		// an app keeps for it; the tax authority's reason about its fiscalization is kept apart
-		$rejectionReason = $status === DocumentStatus::REJECTED ? $this->rejectionReason($document) : null;
+		// Why the buyer rejected it (the buyer's note) is the reason an app keeps for it, and for one that could not be
+		// delivered the failed delivery's words; the tax authority's reason about its fiscalization is kept apart
+		$rejectionReason = $status === DocumentStatus::REJECTED ? $this->statusWords($document, self::REJECTED_CODE) : null;
+		$deliveryError = $status === DocumentStatus::UNDELIVERED ? $this->statusWords($document, self::DELIVERY_FAILED_CODE) : null;
+		$retrying = $status === DocumentStatus::SENT && (int) ($document['status'] ?? 0) === self::DELIVERY_FAILED_CODE;
 
 		// Every payment report it took is an eReporting request of its own, answered or not
 		$paymentReports = collect((array) ($document['eReportingRequests'] ?? []))
@@ -181,9 +203,23 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain
 			->count();
 
 		return [
-			'status' => $status, 'fiscalization' => $fiscalization, 'error' => $rejectionReason ?? $fiscalizationError, 'payment' => $payment, 'paymentError' => $paymentError, 'paymentReports' => $paymentReports, 'answersError' => null,
+			'status' => $status, 'fiscalization' => $fiscalization, 'error' => $rejectionReason ?? $deliveryError ?? $fiscalizationError, 'payment' => $payment, 'paymentError' => $paymentError, 'paymentReports' => $paymentReports, 'answersError' => null,
 			'rejectionReason' => $rejectionReason, 'fiscalizationError' => $fiscalizationError,
+			'deliveryRetriesUntil' => $retrying ? $this->retriesUntil($document)->toIso8601String() : null,
+			'accepted' => in_array((int) ($document['status'] ?? 0), self::ACCEPTED_CODES, true),
 		];
+	}
+
+	public function businessUnits(string $oib): array
+	{
+		$units = $this->call('get', '/api/v2/businessunits/' . rawurlencode($oib));
+
+		return collect(array_is_list($units) ? $units : [$units])
+			->filter(fn ($unit) => is_array($unit) && filled($unit['code'] ?? null))
+			->map(fn (array $unit) => ['name' => trim((string) ($unit['name'] ?? '')), 'code' => HrUbl::businessUnitCode((string) $unit['code'], $oib)])
+			->filter(fn (array $unit) => $unit['code'] !== '')
+			->values()
+			->all();
 	}
 
 	public function reportPayment(string $electronicId, string $paidOn, float $amount): void
@@ -192,7 +228,7 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain
 			'paymentDate' => $paidOn,
 			'paidAmount' => round($amount, 2),
 			'paymentType' => self::PAYMENT_BY_TRANSFER,
-		]);
+		], paymentReport: true);
 	}
 
 	public function fiscalizeAgain(string $electronicId): void
@@ -202,15 +238,34 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain
 
 	/**
 	 * The service answers its ping only to a key it knows; the account is then asked whether ePoslovanje fiscalizes
-	 * its outgoing documents itself, as an account that does not leaves every e-invoice unreported.
+	 * its outgoing documents itself, as an account that does not leaves every e-invoice unreported. Either call that
+	 * gets no whole answer, or a server error, leaves the account untried (connectionTest()).
 	 */
 	public function ping(): void
 	{
 		$account = $this->account();
 
-		// No answer, or one cut off on its way, leaves the account untried
+		$this->connectionTest('/api/v2/ping', $account);
+		$settings = $this->connectionTest('/api/v2/account/f2settings', $account);
+		$outgoing = $settings['AutomaticFiscalizeOutgoingInvoices'] ?? $settings['automaticFiscalizeOutgoingInvoices'] ?? null;
+
+		if ($outgoing === false) {
+			throw new RuntimeException('ePoslovanje does not fiscalize this account\'s outgoing documents: switch on automatic fiscalization of outgoing documents in the account\'s profile.');
+		}
+	}
+
+	/**
+	 * A call of the connection test with the account's key. One that gets no whole answer (none at all, or one cut off
+	 * on its way), or a server error, finds the service down and the account untried: an EInvoiceUnavailableException.
+	 * A refusal is the account's.
+	 *
+	 * @param  array<string, mixed>  $account
+	 * @return array<int|string, mixed>
+	 */
+	protected function connectionTest(string $path, array $account): array
+	{
 		try {
-			$response = $this->request($account)->get($this->serviceFor(self::SERVICES, $account) . '/api/v2/ping');
+			$response = $this->request($account)->get($this->serviceFor(self::SERVICES, $account) . $path);
 		} catch (HttpClientException $exception) {
 			throw new EInvoiceUnavailableException($this->transportFailure($exception, $account));
 		}
@@ -224,16 +279,14 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain
 			throw new RuntimeException($this->failure($response, $account));
 		}
 
-		$settings = $this->call('get', '/api/v2/account/f2settings', [], $account);
-		$outgoing = $settings['AutomaticFiscalizeOutgoingInvoices'] ?? $settings['automaticFiscalizeOutgoingInvoices'] ?? null;
+		$json = $response->json();
 
-		if ($outgoing === false) {
-			throw new RuntimeException('ePoslovanje does not fiscalize this account\'s outgoing documents: switch on automatic fiscalization of outgoing documents in the account\'s profile.');
-		}
+		return is_array($json) ? $json : [];
 	}
 
 	/**
-	 * ePoslovanje's code of the document's standing as the package's.
+	 * ePoslovanje's code of the document's standing as the package's: a failed delivery is still on its way while
+	 * ePoslovanje tries again, and undelivered once the days it does so are over.
 	 *
 	 * @param  array<string, mixed>  $document
 	 */
@@ -243,9 +296,27 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain
 
 		return match (true) {
 			in_array($code, self::DELIVERED_CODES, true) => DocumentStatus::DELIVERED,
-			in_array($code, self::REJECTED_CODES, true) => DocumentStatus::REJECTED,
+			$code === self::REJECTED_CODE => DocumentStatus::REJECTED,
+			$code === self::DELIVERY_FAILED_CODE => CarbonImmutable::now()->gte($this->retriesUntil($document)) ? DocumentStatus::UNDELIVERED : DocumentStatus::SENT,
 			default => DocumentStatus::SENT,
 		};
+	}
+
+	/**
+	 * Until when ePoslovanje tries again to deliver the document: DELIVERY_RETRY_DAYS after it took it (insertedOn), or
+	 * from now when it names no such moment.
+	 *
+	 * @param  array<string, mixed>  $document
+	 */
+	protected function retriesUntil(array $document): CarbonImmutable
+	{
+		try {
+			$taken = filled($document['insertedOn'] ?? null) ? CarbonImmutable::parse((string) $document['insertedOn']) : CarbonImmutable::now();
+		} catch (InvalidArgumentException) {
+			$taken = CarbonImmutable::now();
+		}
+
+		return $taken->addDays(self::DELIVERY_RETRY_DAYS);
 	}
 
 	/**
@@ -284,15 +355,15 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain
 	}
 
 	/**
-	 * Why the document will not reach the buyer: the note of its latest rejection or failed delivery, else that
-	 * entry's text; null when ePoslovanje says nothing.
+	 * The words of the document's latest entry of the given standing (the buyer's rejection, a failed delivery): its
+	 * note, else its text; null when ePoslovanje says nothing.
 	 *
 	 * @param  array<string, mixed>  $document
 	 */
-	protected function rejectionReason(array $document): ?string
+	protected function statusWords(array $document, int $code): ?string
 	{
 		$entry = collect((array) ($document['statusHistory'] ?? []))
-			->filter(fn ($row) => is_array($row) && in_array((int) ($row['status'] ?? 0), self::REJECTED_CODES, true))
+			->filter(fn ($row) => is_array($row) && (int) ($row['status'] ?? 0) === $code)
 			->sortBy(fn (array $row) => (string) ($row['createdOn'] ?? ''))
 			->last();
 
@@ -311,7 +382,7 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain
 	 * @param  array<string, mixed>|null  $account
 	 * @return array<int|string, mixed>
 	 */
-	protected function call(string $method, string $path, array $payload = [], ?array $account = null, bool $refusable = false): array
+	protected function call(string $method, string $path, array $payload = [], ?array $account = null, bool $refusable = false, bool $paymentReport = false): array
 	{
 		$account ??= $this->account();
 		$url = $this->serviceFor(self::SERVICES, $account) . $path;
@@ -326,6 +397,12 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain
 
 		if ($refusable && $this->refusesDocument($response)) {
 			throw new EInvoiceRefusedException($this->failure($response, $account));
+		}
+
+		// A payment report refused on the spot (the tax authority's refusal passed on, a report it could not take) is
+		// said as such, for the app to word; a failure of the line or of the service is an ordinary one
+		if ($paymentReport && in_array($response->status(), [400, 422], true)) {
+			throw new PaymentReportRefusedException($this->failure($response, $account));
 		}
 
 		if (!$response->successful()) {

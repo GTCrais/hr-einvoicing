@@ -7,6 +7,7 @@ use GTCrais\HrEInvoicing\EPoslovanje\Contracts\AccountProvider;
 use GTCrais\HrEInvoicing\EPoslovanje\EPoslovanjeClient;
 use GTCrais\HrEInvoicing\Exceptions\EInvoiceRefusedException;
 use GTCrais\HrEInvoicing\Exceptions\EInvoiceUnavailableException;
+use GTCrais\HrEInvoicing\Exceptions\PaymentReportRefusedException;
 use GTCrais\HrEInvoicing\FiscalizationStatus;
 use GTCrais\HrEInvoicing\GatewayManager;
 use Illuminate\Http\Client\Request;
@@ -220,6 +221,7 @@ it('gives up on a list of outgoing documents it cannot read through in its time,
 });
 
 it('reads the document standing and the tax authority answer off the status answer', function () {
+	$this->travelTo(Carbon::parse('2026-10-26 10:00:00', 'UTC'));
 	$request = fn (array $fields) => ['type' => 1, 'description' => 'Evidencija izlaznog računa', ...$fields];
 	Http::fake([
 		'https://test.eposlovanje.hr/api/v2/document/status/1' => Http::response(['id' => 1, 'documentId' => '455/P1/1', 'status' => 4, 'eReportingRequests' => [
@@ -237,7 +239,7 @@ it('reads the document standing and the tax authority answer off the status answ
 			['createdOn' => '2026-10-24T12:00:00+02:00', 'status' => 4, 'statusText' => 'Zaprimljen od strane primatelja'],
 			['createdOn' => '2026-10-24T12:30:00+02:00', 'status' => 6, 'statusText' => 'Odbijen', 'note' => 'Odbijen jer iznos nije ispravan'],
 		], 'eReportingRequests' => [$request(['createdOn' => '2026-10-24T12:00:00+02:00', 'success' => true, 'completedOn' => '2026-10-24T12:00:05+02:00'])]]),
-		'https://test.eposlovanje.hr/api/v2/document/status/6' => Http::response(['id' => 6, 'status' => 9, 'statusHistory' => [
+		'https://test.eposlovanje.hr/api/v2/document/status/6' => Http::response(['id' => 6, 'status' => 9, 'insertedOn' => '2026-10-24T12:00:00+02:00', 'statusHistory' => [
 			['createdOn' => '2026-10-24T12:30:00+02:00', 'status' => 9, 'statusText' => 'Neuspješna isporuka'],
 		]]),
 		'https://test.eposlovanje.hr/api/v2/document/status/7' => Http::response(['id' => 7, 'status' => 7, 'eReportingRequests' => []]),
@@ -277,8 +279,8 @@ it('reads the document standing and the tax authority answer off the status answ
 	$client = app(EPoslovanjeClient::class);
 
 	// The reason to keep is the tax authority's for any but a rejected document, which it is kept apart for too
-	$answer = fn (DocumentStatus $status, ?FiscalizationStatus $fiscalization, ?string $error, ?FiscalizationStatus $payment = null, ?string $paymentError = null, int $paymentReports = 0) => [...compact('status', 'fiscalization', 'error', 'payment', 'paymentError', 'paymentReports'), 'answersError' => null, 'rejectionReason' => null, 'fiscalizationError' => $error];
-	$rejected = fn (?FiscalizationStatus $fiscalization, string $reason, ?string $fiscalizationError = null) => [...$answer(DocumentStatus::REJECTED, $fiscalization, $reason), 'rejectionReason' => $reason, 'fiscalizationError' => $fiscalizationError];
+	$answer = fn (DocumentStatus $status, ?FiscalizationStatus $fiscalization, ?string $error, ?FiscalizationStatus $payment = null, ?string $paymentError = null, int $paymentReports = 0) => [...compact('status', 'fiscalization', 'error', 'payment', 'paymentError', 'paymentReports'), 'answersError' => null, 'rejectionReason' => null, 'fiscalizationError' => $error, 'deliveryRetriesUntil' => null, 'accepted' => false];
+	$rejected = fn (?FiscalizationStatus $fiscalization, string $reason, ?string $fiscalizationError = null) => [...$answer(DocumentStatus::REJECTED, $fiscalization, $reason), 'rejectionReason' => $reason, 'fiscalizationError' => $fiscalizationError, 'deliveryRetriesUntil' => null, 'accepted' => false];
 
 	expect($client->status('1'))->toBe($answer(DocumentStatus::DELIVERED, FiscalizationStatus::FISCALIZED, null))
 		// A fiscalization taken stays taken, a refused duplicate after it changes nothing; the payment report is apart
@@ -286,7 +288,8 @@ it('reads the document standing and the tax authority answer off the status answ
 		->and($client->status('3'))->toBe($answer(DocumentStatus::SENT, FiscalizationStatus::WAITING, null))
 		->and($client->status('4'))->toBe($answer(DocumentStatus::SENT, null, null))
 		->and($client->status('5'))->toBe($rejected(FiscalizationStatus::FISCALIZED, 'Odbijen jer iznos nije ispravan'))
-		->and($client->status('6'))->toBe($rejected(null, 'Neuspješna isporuka'))
+		// A failed delivery is tried again, so the document is on its way still
+		->and($client->status('6'))->toBe([...$answer(DocumentStatus::SENT, null, null), 'deliveryRetriesUntil' => '2026-10-31T12:00:00+02:00'])
 		// The buyer's note is the reason a rejected document keeps, though the tax authority refused it too, whose reason
 		// stays apart
 		->and($client->status('12'))->toBe($rejected(FiscalizationStatus::FAILED, 'iznos nije ispravan', 'S006 Pristupna točka nije ovlaštena za dostavu podataka'))
@@ -310,8 +313,9 @@ it('reports a payment by bank transfer, and says the reason when the intermediar
 
 	Http::assertSent(fn (Request $request) => $request->url() === 'https://test.eposlovanje.hr/api/v2/ereporting/paid/12345'
 		&& $request->data() === ['paymentDate' => '2026-10-22', 'paidAmount' => 167.0, 'paymentType' => 1]);
+	// Refused on the spot: said as such, for the app to word it as a refusal rather than a line that failed
 	expect(fn () => $client->reportPayment('12345', '2026-10-22', 167.0))
-		->toThrow(RuntimeException::class, 'HTTP 400: Greška u parametrima zahtjeva (Dokument nije fiskaliziran kao izlazni dokument)');
+		->toThrow(PaymentReportRefusedException::class, 'HTTP 400: Greška u parametrima zahtjeva (Dokument nije fiskaliziran kao izlazni dokument)');
 });
 
 it('tells a service that is down from a key it refuses when the connection is tested, and an account that fiscalizes nothing', function () {
@@ -343,18 +347,45 @@ it('tells a service that is down from a key it refuses when the connection is te
 	Http::assertSentCount(6);
 });
 
-it('never says the account\'s API key, however the answer carries it', function () {
+it('finds the service down, never the key refused, when the account\'s settings get no answer, an answer cut off on its way or a server error', function () {
 	Http::fake([
-		'https://test.eposlovanje.hr/api/v2/document/send' => Http::sequence()
-			->push(['error' => 'Greška pri autentifikaciji korisnika', 'details' => 'Ključ 1234567890abcdef1234567890abcdef nije pronađen'], 400)
-			->push('<html><body>Unauthorized: 1234567890abcdef1234567890abcdef</body></html>', 401),
+		'https://test.eposlovanje.hr/api/v2/ping' => Http::response(['status' => 'OK', 'message' => 'Svi servisi su pokrenuti i ispravno rade...']),
+		'https://test.eposlovanje.hr/api/v2/account/f2settings' => Http::sequence()
+			->pushFailedConnection('cURL error 28: Operation timed out after 15001 milliseconds')
+			->pushResponse(answerCutOff(502, '<title>502 Bad Gate'))
+			->push(['error' => 'Service Unavailable'], 503)
+			->push(['error' => 'Greška pri autentifikaciji korisnika', 'details' => 'Korisnički račun nije aktiviran'], 400),
 	]);
 	$client = app(EPoslovanjeClient::class);
 
-	$messages = array_map(fn () => rescue(fn () => $client->send('<Invoice/>'), fn (Throwable $exception) => $exception->getMessage(), false), range(1, 2));
+	expect(fn () => $client->ping())->toThrow(EInvoiceUnavailableException::class, 'cURL error 28: Operation timed out after 15001 milliseconds')
+		->and(fn () => $client->ping())->toThrow(EInvoiceUnavailableException::class, 'HTTP 502: <title>502 Bad Gate')
+		->and(fn () => $client->ping())->toThrow(EInvoiceUnavailableException::class, 'HTTP 503');
+
+	// A refusal of the settings is the account's
+	$exception = rescue(fn () => $client->ping(), fn (Throwable $exception) => $exception, false);
+
+	expect($exception)->toBeInstanceOf(RuntimeException::class)
+		->not->toBeInstanceOf(EInvoiceUnavailableException::class)
+		->and($exception->getMessage())->toBe('HTTP 400: Greška pri autentifikaciji korisnika (Korisnički račun nije aktiviran)');
+});
+
+it('never says the account\'s API key, however the answer carries it', function () {
+	config(['hrEInvoicing.ePoslovanje.apiKey' => '1234567890abcdef&1234567890abcdef']);
+	Http::fake([
+		'https://test.eposlovanje.hr/api/v2/document/send' => Http::sequence()
+			->push(['error' => 'Greška pri autentifikaciji korisnika', 'details' => 'Ključ 1234567890abcdef&1234567890abcdef nije pronađen'], 400)
+			->push('<html><body>Unauthorized: 1234567890abcdef&1234567890abcdef</body></html>', 401)
+			// Written as HTML escapes it
+			->push('<html><body>Unauthorized: 1234567890abcdef&amp;1234567890abcdef</body></html>', 401),
+	]);
+	$client = app(EPoslovanjeClient::class);
+
+	$messages = array_map(fn () => rescue(fn () => $client->send('<Invoice/>'), fn (Throwable $exception) => $exception->getMessage(), false), range(1, 3));
 
 	expect($messages)->toBe([
 		'HTTP 400: Greška pri autentifikaciji korisnika (Ključ [redacted] nije pronađen)',
+		'HTTP 401: <html><body>Unauthorized: [redacted]</body></html>',
 		'HTTP 401: <html><body>Unauthorized: [redacted]</body></html>',
 	]);
 });
@@ -462,4 +493,62 @@ it('refuses the production server outside a production installation, sends to it
 	expect(app(EPoslovanjeClient::class)->send('<Invoice/>')['electronicId'])->toBe('2');
 
 	Http::assertSent(fn (Request $request) => $request->url() === 'https://test.eposlovanje.hr/api/v2/document/send' && $request->hasHeader('Authorization', 'test-key'));
+});
+
+it('tries a failed delivery again for a week from when ePoslovanje took the document, and holds it undelivered after, which a lookup finds held too', function () {
+	$this->travelTo(Carbon::parse('2026-10-30 10:00:00', 'UTC'));
+	$failed = fn (int $id, string $inserted) => Http::response(['id' => $id, 'status' => 9, 'insertedOn' => $inserted, 'statusHistory' => [
+		['createdOn' => $inserted, 'status' => 2, 'statusText' => 'Validacija završena, čeka slanje'],
+		['createdOn' => $inserted, 'status' => 9, 'statusText' => 'Neuspješna isporuka'],
+	], 'eReportingRequests' => []]);
+	Http::fake([
+		'https://test.eposlovanje.hr/api/v2/document/status/1' => $failed(1, '2026-10-28T09:00:00+01:00'),
+		'https://test.eposlovanje.hr/api/v2/document/status/2' => $failed(2, '2026-10-22T09:00:00+02:00'),
+		'https://test.eposlovanje.hr/api/v2/document/outgoing*' => Http::sequence()
+			->push([['id' => 2, 'documentId' => '7/P1/1', 'issuedOn' => '2026-10-22T09:00:00', 'insertedOn' => '2026-10-22T09:00:00+02:00', 'status' => 9]])
+			->push([]),
+	]);
+	$client = app(EPoslovanjeClient::class);
+
+	// Two days in: on its way still, tried until a week after ePoslovanje took it
+	expect($client->status('1'))->toMatchArray(['status' => DocumentStatus::SENT, 'error' => null, 'fiscalization' => null, 'deliveryRetriesUntil' => '2026-11-04T09:00:00+01:00'])
+		// Past the week: undelivered, with ePoslovanje's words, never fiscalized, and held until deleted there
+		->and($client->status('2'))->toMatchArray(['status' => DocumentStatus::UNDELIVERED, 'error' => 'Neuspješna isporuka', 'fiscalization' => null, 'rejectionReason' => null, 'fiscalizationError' => null, 'deliveryRetriesUntil' => null])
+		->and($client->sentDocument('7/P1/1', Carbon::parse('2026-10-22 07:00:00', 'UTC')))->toBe(['electronicId' => '2', 'status' => DocumentStatus::UNDELIVERED])
+		->and(DocumentStatus::UNDELIVERED->isHeld())->toBeTrue();
+});
+
+it('takes a document the buyer approved or paid for accepted, after which no rejection comes, and the buyer\'s rejection with its note', function () {
+	$document = fn (int $id, int $status, array $history = []) => Http::response(['id' => $id, 'status' => $status, 'statusHistory' => $history, 'eReportingRequests' => []]);
+	Http::fake([
+		'https://test.eposlovanje.hr/api/v2/document/status/4' => $document(4, 4),
+		'https://test.eposlovanje.hr/api/v2/document/status/5' => $document(5, 5),
+		'https://test.eposlovanje.hr/api/v2/document/status/6' => $document(6, 6, [['createdOn' => '2026-10-29T10:00:00+01:00', 'status' => 6, 'statusText' => 'Odbijen', 'note' => 'Pogrešna poslovna jedinica']]),
+		'https://test.eposlovanje.hr/api/v2/document/status/7' => $document(7, 7),
+		'https://test.eposlovanje.hr/api/v2/document/status/8' => $document(8, 8),
+	]);
+	$client = app(EPoslovanjeClient::class);
+
+	expect(collect([4, 5, 7, 8])->map(fn (int $id) => [$client->status((string) $id)['status'], $client->status((string) $id)['accepted']])->all())
+		->toBe([[DocumentStatus::DELIVERED, false], [DocumentStatus::DELIVERED, true], [DocumentStatus::DELIVERED, true], [DocumentStatus::DELIVERED, true]])
+		->and($client->status('6'))->toMatchArray(['status' => DocumentStatus::REJECTED, 'error' => 'Pogrešna poslovna jedinica', 'rejectionReason' => 'Pogrešna poslovna jedinica', 'accepted' => false]);
+});
+
+it('lists a company\'s business units by their own codes, and none for a company without any', function () {
+	Http::fake([
+		'https://test.eposlovanje.hr/api/v2/businessunits/69693144506' => Http::response([
+			['name' => 'HŠ D.O.O. UPRAVA ŠUMA PODRUŽNICA SENJ', 'code' => '9934:69693144506::HR99:1200'],
+			['name' => 'Podružnica Split', 'code' => '9934:69693144506::HR99:1300'],
+		]),
+		'https://test.eposlovanje.hr/api/v2/businessunits/12345678903' => Http::response([]),
+	]);
+	$client = app(EPoslovanjeClient::class);
+
+	expect($client->businessUnits('69693144506'))->toBe([
+		['name' => 'HŠ D.O.O. UPRAVA ŠUMA PODRUŽNICA SENJ', 'code' => '1200'],
+		['name' => 'Podružnica Split', 'code' => '1300'],
+	])
+		->and($client->businessUnits('12345678903'))->toBe([]);
+
+	Http::assertSent(fn (Request $request) => $request->url() === 'https://test.eposlovanje.hr/api/v2/businessunits/69693144506' && $request->hasHeader('Authorization'));
 });

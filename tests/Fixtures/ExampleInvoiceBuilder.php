@@ -33,7 +33,7 @@ class ExampleInvoiceBuilder
 
 		$root = $this->document($creditNote);
 
-		$this->extensions($root, $categories, $net, $tax, 'EUR', $invoice['vatRegistered']);
+		$this->extensions($root, $categories, $net, $tax, 'EUR', $invoice['vatRegistered'], $invoice['cashBasis'] ?? false);
 		$this->heading($root, $invoice['profile'], $invoice['number'], new DateTimeImmutable($invoice['issuedAt']));
 
 		if ($creditNote) {

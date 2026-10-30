@@ -6,6 +6,7 @@ use DateTimeInterface;
 use DOMDocument;
 use DOMElement;
 use GTCrais\HrEInvoicing\Ubl\HrUbl;
+use InvalidArgumentException;
 
 /**
  * Writes the parts every Croatian e-invoice shares, the way Moj-eRačun's examples write them, for a builder that maps
@@ -13,10 +14,11 @@ use GTCrais\HrEInvoicing\Ubl\HrUbl;
  * signature block the intermediary fills), the heading, references to earlier invoices, the parties named by OIB,
  * delivery, payment by transfer, the VAT breakdown, the totals and the lines. Elements without text are left out,
  * as the rules forbid empty ones: a value blank once trimmed writes no element, and a part none of whose elements was
- * written (a contact without its operator, an account without its IBAN, a delivery without its day) is left out with
- * them. Text goes in as XML 1.0 takes it, whatever was typed or pasted: a character it forbids (a control character,
- * such as the line break Word pastes, U+000B) is left out, the vertical tab and the form feed as a space, so one stray
- * character never leaves a document no intermediary can read.
+ * written (a contact without its operator, a delivery without its day) is left out with them; a payment by transfer
+ * without the IBAN it is paid to is refused instead (EN 16931 BR-61). Text goes in as XML 1.0 takes it, whatever was
+ * typed or pasted: a character it forbids (a control character, such as the line break Word pastes, U+000B) is left
+ * out, the vertical tab and the form feed as a space, so one stray character never leaves a document no intermediary
+ * can read.
  *
  * A VAT category is an array of the id ("S" standard, "E" exempt, "O" outside the scope of VAT, which every line of an
  * issuer outside the VAT system is), the Croatian name ("HR:PDV25", "HR:E", "HR:O"), the percent and the exemption's
@@ -48,16 +50,18 @@ trait WritesHrUbl
 
 	/**
 	 * The extensions: the Croatian VAT breakdown whenever anything is not at a standard rate (always for an issuer
-	 * outside the VAT system), and the signature block, which is the intermediary's to fill.
+	 * outside the VAT system) or the issuer pays VAT on what it was paid ($cashBasis, which only an issuer in the VAT
+	 * system can), and the signature block, which is the intermediary's to fill.
 	 *
 	 * @param  list<array<string, mixed>>  $categories
 	 */
-	protected function extensions(DOMElement $root, array $categories, float $net, float $tax, string $currency, bool $vatRegistered): void
+	protected function extensions(DOMElement $root, array $categories, float $net, float $tax, string $currency, bool $vatRegistered, bool $cashBasis = false): void
 	{
 		$extensions = $this->child($root, 'ext:UBLExtensions');
+		$cashBasis = $cashBasis && $vatRegistered;
 
-		if (!$vatRegistered || array_filter($categories, fn (array $category) => $category['id'] !== 'S') !== []) {
-			$this->hrData($this->child($this->child($extensions, 'ext:UBLExtension'), 'ext:ExtensionContent'), $categories, $net, $tax, $currency);
+		if ($cashBasis || !$vatRegistered || array_filter($categories, fn (array $category) => $category['id'] !== 'S') !== []) {
+			$this->hrData($this->child($this->child($extensions, 'ext:UBLExtension'), 'ext:ExtensionContent'), $categories, $net, $tax, $currency, $cashBasis);
 		}
 
 		$this->child($this->child($this->child($this->child($extensions, 'ext:UBLExtension'), 'ext:ExtensionContent'), 'sig:UBLDocumentSignatures'), 'sac:SignatureInformation');
@@ -125,22 +129,26 @@ trait WritesHrUbl
 
 	/**
 	 * The buyer: by OIB as the endpoint and the identifier, its seat, its VAT identifier when it is Croatian, and its
-	 * legal name. A Croatian buyer's VAT identifier is "HR" and its OIB whether or not it is in the VAT system: the
+	 * legal name. A buyer that receives e-invoices by business unit (the tax authority's AMS lists it under one) is
+	 * named by that unit's code beside its OIB in the identifier (BT-46, "9934:OIB::HR99:code"), the endpoint staying
+	 * the OIB, as the HR CIUS's example of a business unit has it; without it the buyer's intermediary may fail to
+	 * deliver the document. A Croatian buyer's VAT identifier is "HR" and its OIB whether or not it is in the VAT system: the
 	 * Croatian rules HR-BR-S-1 and HR-BR-E-1 ask every invoice with a line at a standard rate or exempt for the buyer's
 	 * VAT identifier (BT-48), and Moj-eRačun's and ePoslovanje's validators refused one without it, or with the OIB under
 	 * the FRE scheme, on 2026-10-26. An invoice outside the scope of VAT (category O, an issuer outside the VAT system)
 	 * takes none (BR-O-02), so withVatIdentifier false names the buyer by its OIB under the FRE scheme, as Moj-eRačun's
 	 * example of one does.
 	 *
-	 * @param  array{oib: string, name: string, street: ?string, city: ?string, postalCode: ?string, country: string}  $party
+	 * @param  array{oib: string, name: string, street: ?string, city: ?string, postalCode: ?string, country: string, businessUnit?: ?string}  $party
 	 */
 	protected function customerParty(DOMElement $root, array $party, bool $withVatIdentifier = true): void
 	{
 		$customer = $this->child($root, 'cac:AccountingCustomerParty');
 		$element = $this->child($customer, 'cac:Party');
+		$unit = HrUbl::businessUnitCode((string) ($party['businessUnit'] ?? ''), $party['oib']);
 
 		$this->leaf($element, 'cbc:EndpointID', $party['oib'], ['schemeID' => HrUbl::OIB_SCHEME]);
-		$this->leaf($this->child($element, 'cac:PartyIdentification'), 'cbc:ID', HrUbl::OIB_SCHEME . ':' . $party['oib']);
+		$this->leaf($this->child($element, 'cac:PartyIdentification'), 'cbc:ID', HrUbl::OIB_SCHEME . ':' . $party['oib'] . ($unit !== '' ? '::' . HrUbl::BUSINESS_UNIT_SCHEME . ':' . $unit : ''));
 		$this->address($element, $party['street'], $party['city'], $party['postalCode'], $party['country']);
 
 		if ($party['country'] === 'HR') {
@@ -168,15 +176,22 @@ trait WritesHrUbl
 	}
 
 	/**
-	 * Payment by credit transfer to the issuer's account, with the number as the payment reference; the account left
-	 * out without the IBAN.
+	 * Payment by credit transfer to the issuer's account, with the number as the payment reference. A credit transfer
+	 * (code 30) names the account it is paid to (EN 16931 BR-61), so a blank IBAN is refused with an
+	 * InvalidArgumentException, never written as a document the intermediary would refuse.
 	 */
 	protected function paymentMeans(DOMElement $root, string $paymentId, string $iban): void
 	{
+		$account = (string) preg_replace('/\s+/', '', $iban);
+
+		if ($this->xmlText($account) === null) {
+			throw new InvalidArgumentException('The issuer\'s IBAN is blank, and a payment by credit transfer names the account it is paid to (EN 16931 BR-61).');
+		}
+
 		$means = $this->child($root, 'cac:PaymentMeans');
 		$this->leaf($means, 'cbc:PaymentMeansCode', '30');
 		$this->leaf($means, 'cbc:PaymentID', $paymentId);
-		$this->leaf($this->child($means, 'cac:PayeeFinancialAccount'), 'cbc:ID', preg_replace('/\s+/', '', $iban));
+		$this->leaf($this->child($means, 'cac:PayeeFinancialAccount'), 'cbc:ID', $account);
 
 		$this->pruneEmpty($means);
 	}
@@ -291,16 +306,22 @@ trait WritesHrUbl
 	}
 
 	/**
-	 * The Croatian extension: the VAT breakdown by category once more, with the Croatian category names, and the net
-	 * split into what is within the scope of VAT and what is outside it (category O), as Moj-eRačun's example of an
-	 * invoice outside its scope writes them.
+	 * The Croatian extension: an issuer's cash-basis VAT first (HR-BT-15, whose presence alone says it, so it is never
+	 * written for an issuer that does not), then the VAT breakdown by category once more, with the Croatian category
+	 * names, and the net split into what is within the scope of VAT and what is outside it (category O), as Moj-eRačun's
+	 * example of an invoice outside its scope writes them.
 	 *
 	 * @param  list<array<string, mixed>>  $categories
 	 */
-	protected function hrData(DOMElement $content, array $categories, float $net, float $tax, string $currency): void
+	protected function hrData(DOMElement $content, array $categories, float $net, float $tax, string $currency, bool $cashBasis = false): void
 	{
 		$outOfScope = round(array_sum(array_map(fn (array $category) => $category['id'] === 'O' ? (float) $category['base'] : 0.0, $categories)), 2);
 		$data = $this->child($content, 'hrextac:HRFISK20Data');
+
+		if ($cashBasis) {
+			$this->leaf($data, 'hrextac:HRObracunPDVPoNaplati', HrUbl::CASH_BASIS_NOTE);
+		}
+
 		$total = $this->child($data, 'hrextac:HRTaxTotal');
 		$this->amount($total, 'cbc:TaxAmount', $tax, $currency);
 
