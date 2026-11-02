@@ -51,7 +51,7 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain, ListsBusi
 
 	public bool $ready = true;
 
-	/** Each document's standing: error is its failed fiscalization's reason (or a refused or undelivered one's), rejectionReason why the buyer rejected it, deliveryRetriesUntil until when a failed delivery is tried again, accepted whether the buyer approved or paid it @var array<string, array{status: DocumentStatus, fiscalization: ?FiscalizationStatus, error: ?string, payment: ?FiscalizationStatus, paymentError: ?string, paymentReports: int, answersError: ?string, rejectionReason: ?string, deliveryRetriesUntil: ?string, accepted: bool}> */
+	/** Each document's standing: error is its failed fiscalization's reason (or a refused or undelivered one's, or the reason of a delivery still tried again), rejectionReason why the buyer rejected it, deliveryRetriesUntil until when a failed delivery is tried again, accepted whether the buyer approved or paid it @var array<string, array{status: DocumentStatus, fiscalization: ?FiscalizationStatus, error: ?string, payment: ?FiscalizationStatus, paymentError: ?string, paymentReports: int, answersError: ?string, rejectionReason: ?string, deliveryRetriesUntil: ?string, accepted: bool}> */
 	public array $statuses = [];
 
 	/** The business units of each company, by its OIB, as businessUnits() lists them @var array<string, list<array{name: string, code: string}>> */
@@ -201,10 +201,10 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain, ListsBusi
 
 	/**
 	 * What the intermediary will answer for a document from now on; with answersError, the standing alone, the tax
-	 * authority's answers not read. The error is the failed fiscalization's reason (or a refused document's); for a
-	 * REJECTED standing it is why the buyer rejected it, unless that is given apart as rejectionReason
-	 * (the buyer's note), as ePoslovanje keeps it apart from the tax authority's answer. The payment reports it holds
-	 * stay as many as were reported through it, unless a number is given.
+	 * authority's answers not read. The error is the failed fiscalization's reason (or a refused document's, or the
+	 * failed delivery's, undelivered or tried again); for a REJECTED standing it is why the buyer rejected it, unless
+	 * that is given apart as rejectionReason (the buyer's note), as ePoslovanje keeps it apart from the tax authority's
+	 * answer. The payment reports it holds stay as many as were reported through it, unless a number is given.
 	 */
 	public function setStatus(string $electronicId, DocumentStatus $status, ?FiscalizationStatus $fiscalization = null, ?string $error = null, ?FiscalizationStatus $payment = null, ?string $paymentError = null, ?string $answersError = null, ?int $paymentReports = null, ?string $rejectionReason = null, ?string $deliveryRetriesUntil = null, bool $accepted = false): void
 	{
@@ -311,8 +311,9 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain, ListsBusi
 
 	/**
 	 * The standing a test set, or the one the document was sent with. The reason in `error` is the rejection's for a
-	 * rejected document (`rejectionReason`), else the tax authority's about its fiscalization (`fiscalizationError`)
-	 * when it failed, which a rejected document answers apart. With answersError, the tax authority's answers are
+	 * rejected document (`rejectionReason`), else the one set: the tax authority's about its fiscalization
+	 * (`fiscalizationError`) when it failed, which a rejected document answers apart, a refused document's, or a failed
+	 * delivery's, undelivered or tried again. With answersError, the tax authority's answers are
 	 * unknown, as the real clients leave them: fiscalization, payment, their reasons and the payment reports held.
 	 */
 	public function status(string $electronicId): array

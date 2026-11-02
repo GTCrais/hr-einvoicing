@@ -129,15 +129,15 @@ trait WritesHrUbl
 
 	/**
 	 * The buyer: by OIB as the endpoint and the identifier, its seat, its VAT identifier when it is Croatian, and its
-	 * legal name. A buyer that receives e-invoices by business unit (the tax authority's AMS lists it under one) is
-	 * named by that unit's code beside its OIB in the identifier (BT-46, "9934:OIB::HR99:code"), the endpoint staying
-	 * the OIB, as the HR CIUS's example of a business unit has it; without it the buyer's intermediary may fail to
-	 * deliver the document. A Croatian buyer's VAT identifier is "HR" and its OIB whether or not it is in the VAT system: the
-	 * Croatian rules HR-BR-S-1 and HR-BR-E-1 ask every invoice with a line at a standard rate or exempt for the buyer's
-	 * VAT identifier (BT-48), and Moj-eRačun's and ePoslovanje's validators refused one without it, or with the OIB under
-	 * the FRE scheme, on 2026-10-26. An invoice outside the scope of VAT (category O, an issuer outside the VAT system)
-	 * takes none (BR-O-02), so withVatIdentifier false names the buyer by its OIB under the FRE scheme, as Moj-eRačun's
-	 * example of one does.
+	 * legal name. A buyer that receives e-invoices by business unit (its intermediary delivers by unit; the tax
+	 * authority's AMS holds no units) is named by that unit's code beside its OIB in the identifier (BT-46,
+	 * "9934:OIB::HR99:code"), the endpoint staying the OIB, as the HR CIUS's example of a business unit has it; without
+	 * it the buyer's intermediary may fail to deliver the document. A Croatian buyer's VAT identifier is "HR" and its
+	 * OIB whether or not it is in the VAT system: the Croatian rules HR-BR-S-1 and HR-BR-E-1 ask every invoice with a
+	 * line at a standard rate or exempt for the buyer's VAT identifier (BT-48), and Moj-eRačun's and ePoslovanje's
+	 * validators refused one without it, or with the OIB under the FRE scheme, on 2026-10-26. An invoice outside the
+	 * scope of VAT (category O, an issuer outside the VAT system) takes none (BR-O-02), so withVatIdentifier false names
+	 * the buyer by its OIB under the FRE scheme, as Moj-eRačun's example of one does.
 	 *
 	 * @param  array{oib: string, name: string, street: ?string, city: ?string, postalCode: ?string, country: string, businessUnit?: ?string}  $party
 	 */

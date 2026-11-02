@@ -62,7 +62,7 @@ class HrUbl
 	public const string CASH_BASIS_NOTE = 'Obračun prema naplaćenim naknadama';
 
 	/**
-	 * A business unit's own code, from the code alone or the whole address an intermediary or the AMS gives
+	 * A business unit's own code, from the code alone or the whole address an intermediary gives
 	 * ("9934:12345678903::HR99:1200" for the company of that OIB is 1200); '' for none. An InvalidArgumentException for
 	 * a code with a space or a colon in it, or the address of another company.
 	 */

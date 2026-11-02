@@ -326,19 +326,19 @@ it('keeps why the buyer rejected a document apart from why its fiscalization fai
 	expect($gateway->status($rejected))->toMatchArray(['fiscalization' => FiscalizationStatus::WAITING, 'error' => 'Neuspješna dostava', 'rejectionReason' => 'Neuspješna dostava', 'fiscalizationError' => null, 'deliveryRetriesUntil' => null, 'accepted' => false]);
 });
 
-it('answers a delivery tried again, holds an undelivered document until a test deletes it, and lists the business units a test gave', function () {
+it('answers a delivery tried again with its reason, holds an undelivered document until a test deletes it, and lists the business units a test gave', function () {
 	$gateway = new FakeEInvoiceGateway;
 	$xml = '<Invoice><cbc:ID>7/P1/1</cbc:ID><cbc:IssueDate>2026-10-30</cbc:IssueDate></Invoice>';
 	$first = $gateway->send($xml)['electronicId'];
 
-	$gateway->setStatus($first, DocumentStatus::SENT, deliveryRetriesUntil: '2026-11-06T09:00:00+01:00');
+	$gateway->setStatus($first, DocumentStatus::SENT, error: 'Primatelj nema poslovnu jedinicu 1200', deliveryRetriesUntil: '2026-11-06T09:00:00+01:00');
 
-	expect($gateway->status($first))->toMatchArray(['status' => DocumentStatus::SENT, 'deliveryRetriesUntil' => '2026-11-06T09:00:00+01:00', 'accepted' => false]);
+	expect($gateway->status($first))->toMatchArray(['status' => DocumentStatus::SENT, 'error' => 'Primatelj nema poslovnu jedinicu 1200', 'fiscalizationError' => null, 'deliveryRetriesUntil' => '2026-11-06T09:00:00+01:00', 'accepted' => false]);
 
 	// Undelivered: held, so the same number is refused until the document is deleted at the intermediary
-	$gateway->setStatus($first, DocumentStatus::UNDELIVERED, error: 'Neuspješna isporuka');
+	$gateway->setStatus($first, DocumentStatus::UNDELIVERED, error: 'Primatelj nema poslovnu jedinicu 1200');
 
-	expect($gateway->status($first))->toMatchArray(['status' => DocumentStatus::UNDELIVERED, 'error' => 'Neuspješna isporuka', 'deliveryRetriesUntil' => null])
+	expect($gateway->status($first))->toMatchArray(['status' => DocumentStatus::UNDELIVERED, 'error' => 'Primatelj nema poslovnu jedinicu 1200', 'deliveryRetriesUntil' => null])
 		->and($gateway->sentDocument('7/P1/1', Carbon::now()->subMinute()))->toBe(['electronicId' => $first, 'status' => DocumentStatus::UNDELIVERED])
 		->and(fn () => $gateway->send($xml))->toThrow(EInvoiceRefusedException::class, 'already exists');
 

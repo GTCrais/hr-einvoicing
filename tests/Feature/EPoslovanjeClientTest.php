@@ -512,10 +512,32 @@ it('tries a failed delivery again for a week from when ePoslovanje took the docu
 
 	// Two days in: on its way still, tried until a week after ePoslovanje took it
 	expect($client->status('1'))->toMatchArray(['status' => DocumentStatus::SENT, 'error' => null, 'fiscalization' => null, 'deliveryRetriesUntil' => '2026-11-04T09:00:00+01:00'])
-		// Past the week: undelivered, with ePoslovanje's words, never fiscalized, and held until deleted there
-		->and($client->status('2'))->toMatchArray(['status' => DocumentStatus::UNDELIVERED, 'error' => 'Neuspješna isporuka', 'fiscalization' => null, 'rejectionReason' => null, 'fiscalizationError' => null, 'deliveryRetriesUntil' => null])
+		// Past the week: undelivered, never fiscalized, and held until deleted there; the status's own name is no reason
+		->and($client->status('2'))->toMatchArray(['status' => DocumentStatus::UNDELIVERED, 'error' => null, 'fiscalization' => null, 'rejectionReason' => null, 'fiscalizationError' => null, 'deliveryRetriesUntil' => null])
 		->and($client->sentDocument('7/P1/1', Carbon::parse('2026-10-22 07:00:00', 'UTC')))->toBe(['electronicId' => '2', 'status' => DocumentStatus::UNDELIVERED])
 		->and(DocumentStatus::UNDELIVERED->isHeld())->toBeTrue();
+});
+
+it('gives the reason ePoslovanje notes beside a failed delivery, while it tries again and once it stopped, from the latest such entry of the history', function () {
+	$this->travelTo(Carbon::parse('2026-10-30 10:00:00', 'UTC'));
+	$failed = fn (int $id, string $inserted, array $history) => Http::response(['id' => $id, 'status' => 9, 'insertedOn' => $inserted, 'statusHistory' => $history, 'eReportingRequests' => []]);
+	$entry = fn (string $createdOn, string $note) => ['createdOn' => $createdOn, 'status' => 9, 'statusText' => 'Neuspješna isporuka', 'note' => $note];
+	Http::fake([
+		'https://test.eposlovanje.hr/api/v2/document/status/3' => $failed(3, '2026-10-28T09:00:00+01:00', [$entry('2026-10-28T09:05:00+01:00', ' Primatelj nema poslovnu jedinicu 1200 ')]),
+		'https://test.eposlovanje.hr/api/v2/document/status/4' => $failed(4, '2026-10-22T09:00:00+02:00', [
+			$entry('2026-10-23T09:05:00+02:00', 'Primatelj nema poslovnu jedinicu 1200'),
+			$entry('2026-10-22T09:05:00+02:00', 'Primatelj nije dostupan'),
+		]),
+		'https://test.eposlovanje.hr/api/v2/document/status/5' => $failed(5, '2026-10-22T09:00:00+02:00', [$entry('2026-10-22T09:05:00+02:00', '  ')]),
+	]);
+	$client = app(EPoslovanjeClient::class);
+
+	// Two days in: still tried, with the reason given so far
+	expect($client->status('3'))->toMatchArray(['status' => DocumentStatus::SENT, 'error' => 'Primatelj nema poslovnu jedinicu 1200', 'deliveryRetriesUntil' => '2026-11-04T09:00:00+01:00'])
+		// Past the week: undelivered, with the reason of its latest failed try, and neither a rejection nor a fiscalization
+		->and($client->status('4'))->toMatchArray(['status' => DocumentStatus::UNDELIVERED, 'error' => 'Primatelj nema poslovnu jedinicu 1200', 'rejectionReason' => null, 'fiscalizationError' => null, 'deliveryRetriesUntil' => null])
+		// A blank note is no reason
+		->and($client->status('5'))->toMatchArray(['status' => DocumentStatus::UNDELIVERED, 'error' => null]);
 });
 
 it('takes a document the buyer approved or paid for accepted, after which no rejection comes, and the buyer\'s rejection with its note', function () {

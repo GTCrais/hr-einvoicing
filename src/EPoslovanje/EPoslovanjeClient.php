@@ -31,13 +31,17 @@ use RuntimeException;
  * reports it to the tax authority when the account has outgoing fiscalization switched on, and queues it for the
  * buyer's intermediary. A document's answer names its standing with one of ePoslovanje's codes (1 waiting, 2 being
  * sent, 3 sent, 4 delivered, 5 approved, 6 rejected by the buyer, 7 paid, 8 partly paid, 9 delivery failed) and lists
- * its eReporting requests. A failed delivery is no final word (ePoslovanje, 2026-10-30): it tries again, mostly within
- * the week after it took the document, so the document is SENT meanwhile, with the moment it gives up
- * (deliveryRetriesUntil), and UNDELIVERED after it; it is fiscalized only once delivered, so an undelivered one needs
- * no storno: deleted in ePoslovanje's web application (its API has no call for it), it goes again corrected under its
- * number, never as a copy, which could not be fiscalized without the original. The eReporting requests: the
- * first kind is the document's own fiscalization, the fourth a report of its payment, each answered by the tax
- * authority later (`success`, its `errorCode` and `errorDescription`; a refused request is stamped `completedOn` too).
+ * its eReporting requests. A failed delivery is no final word (ePoslovanje, 2026-10-30 and 2026-11-02): it tries again
+ * seven times, mostly within the week after it took the document, so the document is SENT meanwhile, with the moment
+ * it is taken to give up (deliveryRetriesUntil, an estimate: it names neither the moment nor the tries made), and
+ * UNDELIVERED after it, in either state with the reason it gives beside the status in the document's history when it
+ * gives one; it is fiscalized only once delivered, so an undelivered one needs no storno: deleted in ePoslovanje's web
+ * application (its API has no call for it and will have none), it goes again corrected under its number, never as a
+ * copy, which could not be fiscalized without the original. ePoslovanje may also deliver an undelivered document by
+ * hand at the issuer's request, months later even, which a lookup by number (sentDocument()) finds before an app
+ * sends it again. The eReporting requests: the first kind is the document's own fiscalization, the fourth a report of
+ * its payment, each answered by the tax authority later (`success`, its `errorCode` and `errorDescription`; a refused
+ * request is stamped `completedOn` too).
  * The environment is "demo" (the test server) or "production", and a call may take attemptSeconds; the service provider
  * builds it from config('hrEInvoicing'). A failure's message never carries the account's API key.
  */
@@ -75,7 +79,8 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain, ListsBusine
 
 	/**
 	 * The days after ePoslovanje took a document within which it tries again to deliver it, after which a failed
-	 * delivery is taken for final (ePoslovanje, 2026-10-30: mostly within the next seven days)
+	 * delivery is taken for final (ePoslovanje, 2026-10-30: mostly within the next seven days; 2026-11-02: seven
+	 * automatic tries, and once more by hand on request)
 	 */
 	public const int DELIVERY_RETRY_DAYS = 7;
 
@@ -191,11 +196,13 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain, ListsBusine
 		[$fiscalization, $fiscalizationError] = $this->outcome($document, self::FISCALIZATION_REQUEST, anySuccess: true);
 		[$payment, $paymentError] = $this->outcome($document, self::PAYMENT_REQUEST, anySuccess: false);
 
-		// Why the buyer rejected it (the buyer's note) is the reason an app keeps for it, and for one that could not be
-		// delivered the failed delivery's words; the tax authority's reason about its fiscalization is kept apart
+		// Why the buyer rejected it (the buyer's note) is the reason an app keeps for it, and for one whose delivery failed,
+		// tried again or given up, the reason ePoslovanje gives for it; the tax authority's reason about its fiscalization
+		// is kept apart
 		$rejectionReason = $status === DocumentStatus::REJECTED ? $this->statusWords($document, self::REJECTED_CODE) : null;
-		$deliveryError = $status === DocumentStatus::UNDELIVERED ? $this->statusWords($document, self::DELIVERY_FAILED_CODE) : null;
-		$retrying = $status === DocumentStatus::SENT && (int) ($document['status'] ?? 0) === self::DELIVERY_FAILED_CODE;
+		$deliveryFailed = (int) ($document['status'] ?? 0) === self::DELIVERY_FAILED_CODE;
+		$deliveryError = $deliveryFailed ? $this->deliveryReason($document) : null;
+		$retrying = $status === DocumentStatus::SENT && $deliveryFailed;
 
 		// Every payment report it took is an eReporting request of its own, answered or not
 		$paymentReports = collect((array) ($document['eReportingRequests'] ?? []))
@@ -355,21 +362,45 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain, ListsBusine
 	}
 
 	/**
-	 * The words of the document's latest entry of the given standing (the buyer's rejection, a failed delivery): its
-	 * note, else its text; null when ePoslovanje says nothing.
+	 * The words of the document's latest entry of the given standing (the buyer's rejection): its note, else its text;
+	 * null when ePoslovanje says nothing.
 	 *
 	 * @param  array<string, mixed>  $document
 	 */
 	protected function statusWords(array $document, int $code): ?string
 	{
-		$entry = collect((array) ($document['statusHistory'] ?? []))
-			->filter(fn ($row) => is_array($row) && (int) ($row['status'] ?? 0) === $code)
-			->sortBy(fn (array $row) => (string) ($row['createdOn'] ?? ''))
-			->last();
-
+		$entry = $this->latestEntry($document, $code);
 		$reason = trim((string) ($entry['note'] ?? '')) ?: trim((string) ($entry['statusText'] ?? ''));
 
 		return $reason !== '' ? $reason : null;
+	}
+
+	/**
+	 * Why the delivery failed: the reason ePoslovanje gives beside the status in the document's history, the note of
+	 * its latest entry of a failed delivery (promised 2026-11-02); null while it gives none, as the status's own
+	 * description ("Neuspješna isporuka") is no reason.
+	 *
+	 * @param  array<string, mixed>  $document
+	 */
+	protected function deliveryReason(array $document): ?string
+	{
+		$reason = trim((string) ($this->latestEntry($document, self::DELIVERY_FAILED_CODE)['note'] ?? ''));
+
+		return $reason !== '' ? $reason : null;
+	}
+
+	/**
+	 * The document's latest entry of the given standing in its history (by createdOn), null when it has none.
+	 *
+	 * @param  array<string, mixed>  $document
+	 * @return array<string, mixed>|null
+	 */
+	protected function latestEntry(array $document, int $code): ?array
+	{
+		return collect((array) ($document['statusHistory'] ?? []))
+			->filter(fn ($row) => is_array($row) && (int) ($row['status'] ?? 0) === $code)
+			->sortBy(fn (array $row) => (string) ($row['createdOn'] ?? ''))
+			->last();
 	}
 
 	/**
