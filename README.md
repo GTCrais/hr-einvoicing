@@ -105,19 +105,21 @@ A gateway that also implements `Contracts\ListsBusinessUnits` (ePoslovanje, and 
 name) takes `businessUnits($oib)`: the business units a company receives e-invoices under, as the intermediary knows
 them. The tax authority's AMS holds no units, only the OIB or GLN, and whether a unit is checked is the buyer's
 intermediary's affair (FINA refuses a wrong one, some take every invoice; ePoslovanje, 2026-11-02), so a company listed
-with none may still receive by unit. Each comes with its `name` and its `code`, the unit's own code (ePoslovanje lists
-`9934:OIB::HR99:1200`, the package gives `1200`), for a buyer's `businessUnit` (see Writing documents).
+with none may still receive by unit. ePoslovanje's listing is FINA's B2G register, the units of public-sector
+recipients (ePoslovanje, 2026-11-03), so a private company's units at its own intermediary are never in it. Each comes
+with its `name` and its `code`, the unit's own code (ePoslovanje lists `9934:OIB::HR99:1200`, the package gives
+`1200`), for a buyer's `businessUnit` (see Writing documents).
 
 `DocumentStatus` is `SENT` (with the intermediary, on its way), `DELIVERED` (the buyer has it, approved or paid too),
 `REPORTED` (reported to the tax authority instead, because the buyer takes no e-invoices; Moj-eRačun does this),
 `REFUSED` (the intermediary did not take it; a new try sends it afresh), `REJECTED` (the buyer rejected it after it
 received it: the document was exchanged and the tax authority has it, so a storno or a credit note puts it right, never
 a new send, as Moj-eRačun said on 2026-10-30) or `UNDELIVERED` (the intermediary could not deliver it to the buyer's and
-stopped trying, ePoslovanje after seven automatic tries, mostly within the week, though it may still deliver it once
-more by hand at the issuer's request, which a lookup by number finds (ePoslovanje, 2026-11-02): never fiscalized, it
-needs no storno; delete it in the intermediary's web application (ePoslovanje's API has no delete and will have none)
-and send it again, corrected, under the same number, as ePoslovanje advised on 2026-10-30, the buyer's business unit
-being the usual cause; `isHeld()` is true for it, as the intermediary holds it until then).
+stopped trying, ePoslovanje after seven automatic tries, one a night around midnight, so within the week, though it may
+still deliver it once more by hand at the issuer's request, which a lookup by number finds (ePoslovanje, 2026-11-02):
+never fiscalized, it needs no storno; delete it in the intermediary's web application (ePoslovanje's API has no delete
+and will have none) and send it again, corrected, under the same number, as ePoslovanje advised on 2026-10-30, the
+buyer's business unit being the usual cause; `isHeld()` is true for it, as the intermediary holds it until then).
 Moj-eRačun's "Neuspjelo" (50) is final: the document was never exchanged, so the tax authority never saw it and never
 will (Moj-eRačun, 2026-10-27). It is `REFUSED`, and the corrected document goes again under the same number, which
 Moj-eRačun's duplicate check allows for a document in 50 alone.
@@ -126,10 +128,10 @@ type 2 it took) or, for a delivered one, once the buyer set its process status t
 (`queryDocumentProcessStatusOutbox`, `DocumentProcessStatusId` 1, with its `RejectReason`); the process status also
 tells `accepted` (0 approved, 2 paid, 3 partly paid), and one that cannot be read leaves the verdict to the next read.
 ePoslovanje's codes 5, 7 and 8 are `accepted`, 6 is `REJECTED`, and 9 (delivery failed) is `SENT` with
-`deliveryRetriesUntil` while ePoslovanje retries, for `EPoslovanjeClient::DELIVERY_RETRY_DAYS` (7) after it took the
-document, an estimate of its seven automatic tries, and `UNDELIVERED` after that. The law sets no time for a buyer's
-rejection, which mostly comes after the tax authority took the document, so follow a delivered one until it is
-`accepted` or as long as you choose.
+`deliveryRetriesUntil` while ePoslovanje retries, until the end of the `EPoslovanjeClient::DELIVERY_RETRY_DAYS`-th (7)
+day after it took the document, in Croatian time, an estimate of its seven nightly tries (ePoslovanje, 2026-11-03), and
+`UNDELIVERED` after that. The law sets no time for a buyer's rejection, which mostly comes after the tax authority took
+the document, so follow a delivered one until it is `accepted` or as long as you choose.
 `FiscalizationStatus` is `FISCALIZED`, `FAILED` (with the tax authority's code and reason in `fiscalizationError`, and in
 `error` unless the document is `REJECTED`) or `WAITING`. On
 ePoslovanje a fiscalization counts as taken only when it is marked a success (it marks a refused one completed too), and

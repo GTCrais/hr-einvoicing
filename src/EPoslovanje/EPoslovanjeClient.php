@@ -32,16 +32,16 @@ use RuntimeException;
  * buyer's intermediary. A document's answer names its standing with one of ePoslovanje's codes (1 waiting, 2 being
  * sent, 3 sent, 4 delivered, 5 approved, 6 rejected by the buyer, 7 paid, 8 partly paid, 9 delivery failed) and lists
  * its eReporting requests. A failed delivery is no final word (ePoslovanje, 2026-10-30 and 2026-11-02): it tries again
- * seven times, mostly within the week after it took the document, so the document is SENT meanwhile, with the moment
- * it is taken to give up (deliveryRetriesUntil, an estimate: it names neither the moment nor the tries made), and
- * UNDELIVERED after it, in either state with the reason it gives beside the status in the document's history when it
- * gives one; it is fiscalized only once delivered, so an undelivered one needs no storno: deleted in ePoslovanje's web
- * application (its API has no call for it and will have none), it goes again corrected under its number, never as a
- * copy, which could not be fiscalized without the original. ePoslovanje may also deliver an undelivered document by
- * hand at the issuer's request, months later even, which a lookup by number (sentDocument()) finds before an app
- * sends it again. The eReporting requests: the first kind is the document's own fiscalization, the fourth a report of
- * its payment, each answered by the tax authority later (`success`, its `errorCode` and `errorDescription`; a refused
- * request is stamped `completedOn` too).
+ * seven times, once a night around midnight (2026-11-03), so within the week after it took the document, the document
+ * SENT meanwhile with the moment it is taken to give up (deliveryRetriesUntil: the end of the seventh day after it took
+ * it, an estimate, as it names neither the moment nor the tries made), and UNDELIVERED after it, in either state with
+ * the reason it gives beside the status in the document's history when it gives one; it is fiscalized only once
+ * delivered, so an undelivered one needs no storno: deleted in ePoslovanje's web application (its API has no call for
+ * it and will have none), it goes again corrected under its number, never as a copy, which could not be fiscalized
+ * without the original. ePoslovanje may also deliver an undelivered document by hand at the issuer's request, months
+ * later even, which a lookup by number (sentDocument()) finds before an app sends it again. The eReporting requests:
+ * the first kind is the document's own fiscalization, the fourth a report of its payment, each answered by the tax
+ * authority later (`success`, its `errorCode` and `errorDescription`; a refused request is stamped `completedOn` too).
  * The environment is "demo" (the test server) or "production", and a call may take attemptSeconds; the service provider
  * builds it from config('hrEInvoicing'). A failure's message never carries the account's API key.
  */
@@ -80,9 +80,15 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain, ListsBusine
 	/**
 	 * The days after ePoslovanje took a document within which it tries again to deliver it, after which a failed
 	 * delivery is taken for final (ePoslovanje, 2026-10-30: mostly within the next seven days; 2026-11-02: seven
-	 * automatic tries, and once more by hand on request)
+	 * automatic tries, and once more by hand on request; 2026-11-03: once a night around midnight)
 	 */
 	public const int DELIVERY_RETRY_DAYS = 7;
+
+	/**
+	 * The time zone of ePoslovanje's nightly delivery tries (around midnight, Croatian time; ePoslovanje, 2026-11-03), in
+	 * which the end of the last day of trying is worked out
+	 */
+	protected const string TIMEZONE = 'Europe/Zagreb';
 
 	/** The most outgoing documents one listing answers with */
 	protected const int PAGE_SIZE = 1000;
@@ -217,6 +223,13 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain, ListsBusine
 		];
 	}
 
+	/**
+	 * The business units FINA's B2G service lists for the OIB, a public-sector recipient's (ePoslovanje, 2026-11-03: the
+	 * call "covers all FINA B2G business units"), each taken down to its own code; a company that is no such recipient,
+	 * or has no unit there, gets an empty list, which says nothing of units it may have at its own intermediary.
+	 *
+	 * @return list<array{name: string, code: string}>
+	 */
 	public function businessUnits(string $oib): array
 	{
 		$units = $this->call('get', '/api/v2/businessunits/' . rawurlencode($oib));
@@ -310,8 +323,9 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain, ListsBusine
 	}
 
 	/**
-	 * Until when ePoslovanje tries again to deliver the document: DELIVERY_RETRY_DAYS after it took it (insertedOn), or
-	 * from now when it names no such moment.
+	 * Until when ePoslovanje tries again to deliver the document: the end of the DELIVERY_RETRY_DAYS-th day after it took
+	 * it (insertedOn), in Croatian time, as its tries run once a night around midnight (ePoslovanje, 2026-11-03), so the
+	 * seventh falls within that day whichever side of midnight the job runs; from now when it names no such moment.
 	 *
 	 * @param  array<string, mixed>  $document
 	 */
@@ -323,7 +337,7 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain, ListsBusine
 			$taken = CarbonImmutable::now();
 		}
 
-		return $taken->addDays(self::DELIVERY_RETRY_DAYS);
+		return $taken->setTimezone(self::TIMEZONE)->addDays(self::DELIVERY_RETRY_DAYS)->endOfDay();
 	}
 
 	/**

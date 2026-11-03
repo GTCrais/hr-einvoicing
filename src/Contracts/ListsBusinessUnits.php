@@ -6,9 +6,10 @@ namespace GTCrais\HrEInvoicing\Contracts;
  * A gateway whose intermediary lists the business units it knows a company receives e-invoices under, whose codes
  * address an e-invoice to one of them (BT-46, "9934:OIB::HR99:code"). The tax authority's AMS holds no business units,
  * only the company's OIB or GLN, and whether a unit is checked is the buyer's intermediary's affair (FINA refuses an
- * invoice sent to a wrong unit, some intermediaries take every one; ePoslovanje, 2026-11-02), so an empty list never
- * says the company has no unit: the code the buyer gave is typed then. EPoslovanje\EPoslovanjeClient and the fake
- * implement it; an app offers the list only where the gateway does.
+ * invoice sent to a wrong unit, some intermediaries take every one; ePoslovanje, 2026-11-02); ePoslovanje's own listing
+ * is FINA's B2G register, the public-sector recipients' units (2026-11-03), so an empty list never says the company has
+ * no unit: the code the buyer gave is typed then. EPoslovanje\EPoslovanjeClient and the fake implement it; an app
+ * offers the list only where the gateway does.
  */
 interface ListsBusinessUnits
 {

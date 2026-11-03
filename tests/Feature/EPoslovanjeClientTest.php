@@ -289,7 +289,7 @@ it('reads the document standing and the tax authority answer off the status answ
 		->and($client->status('4'))->toBe($answer(DocumentStatus::SENT, null, null))
 		->and($client->status('5'))->toBe($rejected(FiscalizationStatus::FISCALIZED, 'Odbijen jer iznos nije ispravan'))
 		// A failed delivery is tried again, so the document is on its way still
-		->and($client->status('6'))->toBe([...$answer(DocumentStatus::SENT, null, null), 'deliveryRetriesUntil' => '2026-10-31T12:00:00+02:00'])
+		->and($client->status('6'))->toBe([...$answer(DocumentStatus::SENT, null, null), 'deliveryRetriesUntil' => '2026-10-31T23:59:59+01:00'])
 		// The buyer's note is the reason a rejected document keeps, though the tax authority refused it too, whose reason
 		// stays apart
 		->and($client->status('12'))->toBe($rejected(FiscalizationStatus::FAILED, 'iznos nije ispravan', 'S006 Pristupna točka nije ovlaštena za dostavu podataka'))
@@ -510,12 +510,29 @@ it('tries a failed delivery again for a week from when ePoslovanje took the docu
 	]);
 	$client = app(EPoslovanjeClient::class);
 
-	// Two days in: on its way still, tried until a week after ePoslovanje took it
-	expect($client->status('1'))->toMatchArray(['status' => DocumentStatus::SENT, 'error' => null, 'fiscalization' => null, 'deliveryRetriesUntil' => '2026-11-04T09:00:00+01:00'])
+	// Two days in: on its way still, tried until the end of the seventh day after ePoslovanje took it
+	expect($client->status('1'))->toMatchArray(['status' => DocumentStatus::SENT, 'error' => null, 'fiscalization' => null, 'deliveryRetriesUntil' => '2026-11-04T23:59:59+01:00'])
 		// Past the week: undelivered, never fiscalized, and held until deleted there; the status's own name is no reason
 		->and($client->status('2'))->toMatchArray(['status' => DocumentStatus::UNDELIVERED, 'error' => null, 'fiscalization' => null, 'rejectionReason' => null, 'fiscalizationError' => null, 'deliveryRetriesUntil' => null])
 		->and($client->sentDocument('7/P1/1', Carbon::parse('2026-10-22 07:00:00', 'UTC')))->toBe(['electronicId' => '2', 'status' => DocumentStatus::UNDELIVERED])
 		->and(DocumentStatus::UNDELIVERED->isHeld())->toBeTrue();
+});
+
+it('tries a failed delivery again until the end of the seventh day after ePoslovanje took the document, in Croatian time, as its tries run once a night around midnight', function () {
+	Http::fake([
+		'https://test.eposlovanje.hr/api/v2/document/status/1' => Http::response(['id' => 1, 'status' => 9, 'insertedOn' => '2026-10-28T00:10:00+01:00', 'statusHistory' => [
+			['createdOn' => '2026-10-28T00:10:00+01:00', 'status' => 9, 'statusText' => 'Neuspješna isporuka'],
+		], 'eReportingRequests' => []]),
+	]);
+	$client = app(EPoslovanjeClient::class);
+
+	// Twenty past midnight a week after it was taken at ten past: that night's try may be still to come
+	$this->travelTo(Carbon::parse('2026-11-03 23:20:00', 'UTC'));
+	expect($client->status('1'))->toMatchArray(['status' => DocumentStatus::SENT, 'deliveryRetriesUntil' => '2026-11-04T23:59:59+01:00']);
+
+	// Midnight once the seventh day is over: no try is left
+	$this->travelTo(Carbon::parse('2026-11-04 23:00:00', 'UTC'));
+	expect($client->status('1'))->toMatchArray(['status' => DocumentStatus::UNDELIVERED, 'deliveryRetriesUntil' => null]);
 });
 
 it('gives the reason ePoslovanje notes beside a failed delivery, while it tries again and once it stopped, from the latest such entry of the history', function () {
@@ -533,7 +550,7 @@ it('gives the reason ePoslovanje notes beside a failed delivery, while it tries 
 	$client = app(EPoslovanjeClient::class);
 
 	// Two days in: still tried, with the reason given so far
-	expect($client->status('3'))->toMatchArray(['status' => DocumentStatus::SENT, 'error' => 'Primatelj nema poslovnu jedinicu 1200', 'deliveryRetriesUntil' => '2026-11-04T09:00:00+01:00'])
+	expect($client->status('3'))->toMatchArray(['status' => DocumentStatus::SENT, 'error' => 'Primatelj nema poslovnu jedinicu 1200', 'deliveryRetriesUntil' => '2026-11-04T23:59:59+01:00'])
 		// Past the week: undelivered, with the reason of its latest failed try, and neither a rejection nor a fiscalization
 		->and($client->status('4'))->toMatchArray(['status' => DocumentStatus::UNDELIVERED, 'error' => 'Primatelj nema poslovnu jedinicu 1200', 'rejectionReason' => null, 'fiscalizationError' => null, 'deliveryRetriesUntil' => null])
 		// A blank note is no reason
