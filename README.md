@@ -130,8 +130,11 @@ tells `accepted` (0 approved, 2 paid, 3 partly paid), and one that cannot be rea
 ePoslovanje's codes 5, 7 and 8 are `accepted`, 6 is `REJECTED`, and 9 (delivery failed) is `SENT` with
 `deliveryRetriesUntil` while ePoslovanje retries, until the end of the `EPoslovanjeClient::DELIVERY_RETRY_DAYS`-th (7)
 day after it took the document, in Croatian time, an estimate of its seven nightly tries (ePoslovanje, 2026-11-03), and
-`UNDELIVERED` after that. The law sets no time for a buyer's rejection, which mostly comes after the tax authority took
-the document, so follow a delivered one until it is `accepted` or as long as you choose.
+`UNDELIVERED` after that. ePoslovanje writes the moment it took a document (`insertedOn`) without an offset, in Croatian
+time, and the package reads it so whatever time zone the app runs in, as it reads any date of Moj-eRačun's answers that
+comes without an offset (those it has given so far carry one); a date with an offset is read by its offset. The law
+sets no time for a buyer's rejection, which mostly comes after the tax authority took the document, so follow a
+delivered one until it is `accepted` or as long as you choose.
 `FiscalizationStatus` is `FISCALIZED`, `FAILED` (with the tax authority's code and reason in `fiscalizationError`, and in
 `error` unless the document is `REJECTED`) or `WAITING`. On
 ePoslovanje a fiscalization counts as taken only when it is marked a success (it marks a refused one completed too), and

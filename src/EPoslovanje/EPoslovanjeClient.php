@@ -86,7 +86,9 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain, ListsBusine
 
 	/**
 	 * The time zone of ePoslovanje's nightly delivery tries (around midnight, Croatian time; ePoslovanje, 2026-11-03), in
-	 * which the end of the last day of trying is worked out
+	 * which the end of the last day of trying is worked out, and the one it writes a moment in when it gives it without an
+	 * offset (insertedOn: "2026-11-11T17:05:24.338685" for a document taken at 17:05 Croatian time, its test server on
+	 * 2026-10-24 and 2026-11-11)
 	 */
 	protected const string TIMEZONE = 'Europe/Zagreb';
 
@@ -325,14 +327,17 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain, ListsBusine
 	/**
 	 * Until when ePoslovanje tries again to deliver the document: the end of the DELIVERY_RETRY_DAYS-th day after it took
 	 * it (insertedOn), in Croatian time, as its tries run once a night around midnight (ePoslovanje, 2026-11-03), so the
-	 * seventh falls within that day whichever side of midnight the job runs; from now when it names no such moment.
+	 * seventh falls within that day whichever side of midnight the job runs; from now when it names no such moment. The
+	 * moment is read in Croatian time when ePoslovanje writes it without an offset, as it does, whatever time zone the app
+	 * runs in (read in an app's UTC, one taken in the last hour or two before midnight would get its last day a day late),
+	 * and by its offset when it carries one.
 	 *
 	 * @param  array<string, mixed>  $document
 	 */
 	protected function retriesUntil(array $document): CarbonImmutable
 	{
 		try {
-			$taken = filled($document['insertedOn'] ?? null) ? CarbonImmutable::parse((string) $document['insertedOn']) : CarbonImmutable::now();
+			$taken = filled($document['insertedOn'] ?? null) ? CarbonImmutable::parse((string) $document['insertedOn'], self::TIMEZONE) : CarbonImmutable::now();
 		} catch (InvalidArgumentException) {
 			$taken = CarbonImmutable::now();
 		}

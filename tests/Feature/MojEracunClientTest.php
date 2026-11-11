@@ -298,6 +298,24 @@ it('takes the tax authority\'s latest answer by the moment it was given, not by 
 		->and($client->status('3687370'))->toMatchArray(['fiscalization' => FiscalizationStatus::FISCALIZED, 'error' => null, 'payment' => FiscalizationStatus::WAITING, 'paymentError' => null, 'paymentReports' => 2]);
 });
 
+it('reads a date of the tax authority\'s answers written without an offset in Croatian time, whatever zone the app runs in, so it orders right beside one written with an offset', function () {
+	$refused = ['status' => 1, 'errorCode' => 'S006', 'errorCodeDescription' => 'Pristupna točka nije ovlaštena za dostavu podataka'];
+	Http::fake([
+		'https://demo.moj-eracun.hr/apis/v2/queryOutbox' => Http::response([['ElectronicId' => 3687370, 'StatusId' => 40]]),
+		'https://demo.moj-eracun.hr/api/fiscalization/statusOutbox' => Http::response([['electronicId' => 3687370, 'messages' => [
+			// Taken at 23:30 Croatian time in winter (22:30 UTC), after a refusal at 23:00 written without an offset (22:00 UTC)
+			['status' => 0, 'messageType' => 0, 'dateOfFiscalization' => '2026-11-11T23:30:00+01:00'],
+			[...$refused, 'messageType' => 0, 'dateOfFiscalization' => '2026-11-11T23:00:00'],
+			// In summer, two hours ahead of UTC: taken at 23:30 Croatian time (21:30 UTC), after a refusal at 22:45 (20:45 UTC)
+			['status' => 0, 'messageType' => 3, 'dateOfFiscalization' => '2026-07-10T21:30:00Z'],
+			[...$refused, 'messageType' => 3, 'dateOfFiscalization' => '2026-07-10T22:45:00'],
+		]]]),
+	]);
+
+	expect(config('app.timezone'))->toBe('UTC')
+		->and(app(MojEracunClient::class)->status('3687370'))->toMatchArray(['fiscalization' => FiscalizationStatus::FISCALIZED, 'error' => null, 'payment' => FiscalizationStatus::FISCALIZED, 'paymentError' => null, 'paymentReports' => 2]);
+});
+
 it('reports a payment with the transfer method, and says the tax authority code when it refuses one', function () {
 	Http::fake([
 		'https://demo.moj-eracun.hr/api/fiscalization/markPaid' => Http::sequence()

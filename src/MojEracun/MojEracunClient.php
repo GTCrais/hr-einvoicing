@@ -63,6 +63,13 @@ class MojEracunClient implements EInvoiceGateway
 	/** The buyer's process statuses after which no rejection comes: approved, paid, partly paid */
 	protected const array PROCESS_ACCEPTED = [0, 2, 3];
 
+	/**
+	 * The time zone a date of Moj-eRačun's answers is read in when it is written without an offset: Croatian time, the
+	 * service's own. Its answers have carried one so far (the demo's "2026-10-22T16:48:12+02:00", the manual's "…Z"),
+	 * while its manual writes dates without one elsewhere, so one that comes without it is never read in the app's zone
+	 */
+	protected const string TIMEZONE = 'Europe/Zagreb';
+
 	public function __construct(
 		protected AccountProvider $accounts,
 		protected string $environment = 'demo',
@@ -361,8 +368,9 @@ class MojEracunClient implements EInvoiceGateway
 	}
 
 	/**
-	 * The moment a date of an answer names, as a Unix timestamp, whatever offset it is written with; null when it names
-	 * none that can be read.
+	 * The moment a date of an answer names, as a Unix timestamp, whatever offset it is written with, and in Croatian time
+	 * when it is written without one (TIMEZONE), so that dates with and without an offset in one answer order right
+	 * whatever time zone the app runs in; null when it names none that can be read.
 	 */
 	protected function instant(mixed $date): ?int
 	{
@@ -371,7 +379,7 @@ class MojEracunClient implements EInvoiceGateway
 		}
 
 		try {
-			return CarbonImmutable::parse($date)->getTimestamp();
+			return CarbonImmutable::parse($date, self::TIMEZONE)->getTimestamp();
 		} catch (InvalidArgumentException) {
 			return null;
 		}

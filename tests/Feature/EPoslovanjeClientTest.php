@@ -535,6 +535,42 @@ it('tries a failed delivery again until the end of the seventh day after ePoslov
 	expect($client->status('1'))->toMatchArray(['status' => DocumentStatus::UNDELIVERED, 'deliveryRetriesUntil' => null]);
 });
 
+it('reads the moment ePoslovanje took the document, which it writes without an offset, in Croatian time whatever zone the app runs in, and one written with an offset by its offset', function () {
+	$failed = fn (int $id, string $inserted) => Http::response(['id' => $id, 'status' => 9, 'insertedOn' => $inserted, 'statusHistory' => [
+		['createdOn' => $inserted, 'status' => 9, 'statusText' => 'Neuspješna isporuka'],
+	], 'eReportingRequests' => []]);
+	Http::fake([
+		// Taken at 23:30 in winter and at 22:30 in summer, Croatian time, written as ePoslovanje writes it (2026-11-11)
+		'https://test.eposlovanje.hr/api/v2/document/status/1' => $failed(1, '2026-11-11T23:30:00.338685'),
+		'https://test.eposlovanje.hr/api/v2/document/status/2' => $failed(2, '2026-07-10T22:30:00'),
+		// The winter moment with its offset, and 23:30 UTC, half past midnight in Zagreb, whose offset outweighs Croatian time
+		'https://test.eposlovanje.hr/api/v2/document/status/3' => $failed(3, '2026-11-11T23:30:00+01:00'),
+		'https://test.eposlovanje.hr/api/v2/document/status/4' => $failed(4, '2026-11-11T23:30:00+00:00'),
+	]);
+	$client = app(EPoslovanjeClient::class);
+
+	expect(config('app.timezone'))->toBe('UTC');
+
+	// The last minute of the seventh day after 11 November in Zagreb (winter time, an hour ahead of UTC)
+	$this->travelTo(Carbon::parse('2026-11-18 22:59:00', 'UTC'));
+	expect($client->status('1'))->toMatchArray(['status' => DocumentStatus::SENT, 'deliveryRetriesUntil' => '2026-11-18T23:59:59+01:00'])
+		->and($client->status('3'))->toMatchArray(['status' => DocumentStatus::SENT, 'deliveryRetriesUntil' => '2026-11-18T23:59:59+01:00'])
+		->and($client->status('4'))->toMatchArray(['status' => DocumentStatus::SENT, 'deliveryRetriesUntil' => '2026-11-19T23:59:59+01:00']);
+
+	// Past midnight in Zagreb: those taken at 23:30 Croatian time are given up, the one taken at half past midnight is not
+	$this->travelTo(Carbon::parse('2026-11-18 23:00:01', 'UTC'));
+	expect($client->status('1'))->toMatchArray(['status' => DocumentStatus::UNDELIVERED, 'deliveryRetriesUntil' => null])
+		->and($client->status('3'))->toMatchArray(['status' => DocumentStatus::UNDELIVERED, 'deliveryRetriesUntil' => null])
+		->and($client->status('4'))->toMatchArray(['status' => DocumentStatus::SENT, 'deliveryRetriesUntil' => '2026-11-19T23:59:59+01:00']);
+
+	// Summer time, two hours ahead of UTC: the last minute of 17 July in Zagreb, then past its midnight
+	$this->travelTo(Carbon::parse('2026-07-17 21:59:00', 'UTC'));
+	expect($client->status('2'))->toMatchArray(['status' => DocumentStatus::SENT, 'deliveryRetriesUntil' => '2026-07-17T23:59:59+02:00']);
+
+	$this->travelTo(Carbon::parse('2026-07-17 22:00:01', 'UTC'));
+	expect($client->status('2'))->toMatchArray(['status' => DocumentStatus::UNDELIVERED, 'deliveryRetriesUntil' => null]);
+});
+
 it('gives the reason ePoslovanje notes beside a failed delivery, while it tries again and once it stopped, from the latest such entry of the history', function () {
 	$this->travelTo(Carbon::parse('2026-10-30 10:00:00', 'UTC'));
 	$failed = fn (int $id, string $inserted, array $history) => Http::response(['id' => $id, 'status' => 9, 'insertedOn' => $inserted, 'statusHistory' => $history, 'eReportingRequests' => []]);
