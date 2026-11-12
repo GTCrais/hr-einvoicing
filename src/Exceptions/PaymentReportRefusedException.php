@@ -8,6 +8,8 @@ use RuntimeException;
  * The intermediary refused the payment report on the spot (HTTP 400 or 422: the tax authority's refusal passed on at
  * once, as Moj-eRačun does, or a report it could not take), as against a report it took whose fiscalization the tax
  * authority refused later (read from the document's status); the message says why. The report may be made again once
- * the reason is put right, so an app words it as a refusal, not as a line that failed.
+ * the reason is put right, so an app words it as a refusal, not as a line that failed. A refusal of the account (a
+ * wrong password, software identifier or key, its funds run out, an account not active) is a plain RuntimeException
+ * instead, as on a send: it passes once the account is put right.
  */
 class PaymentReportRefusedException extends RuntimeException {}

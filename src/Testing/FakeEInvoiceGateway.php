@@ -222,11 +222,16 @@ class FakeEInvoiceGateway implements EInvoiceGateway, FiscalizesAgain, ListsBusi
 
 	/**
 	 * Delete a document the intermediary holds, as ePoslovanje's user deletes an undelivered one in its web application:
-	 * it is found no more, and its number may go again.
+	 * it is found no more, and its number may go again. One it never held stays unknown, as the real one knows nothing
+	 * of it.
 	 */
 	public function deleteDocument(string $electronicId): void
 	{
-		$this->statuses[$electronicId] = [...($this->statuses[$electronicId] ?? []), 'status' => DocumentStatus::REFUSED];
+		if (!isset($this->statuses[$electronicId])) {
+			return;
+		}
+
+		$this->statuses[$electronicId]['status'] = DocumentStatus::REFUSED;
 		$this->hiddenFromLookups[$electronicId] = PHP_INT_MAX;
 	}
 

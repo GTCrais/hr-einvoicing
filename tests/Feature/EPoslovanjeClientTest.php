@@ -318,6 +318,30 @@ it('reports a payment by bank transfer, and says the reason when the intermediar
 		->toThrow(PaymentReportRefusedException::class, 'HTTP 400: Greška u parametrima zahtjeva (Dokument nije fiskaliziran kao izlazni dokument)');
 });
 
+it('takes a refusal of the key, the funds or the account on a payment report for one that passes once the account is put right, never for the report refused', function () {
+	Http::fake([
+		'https://test.eposlovanje.hr/api/v2/ereporting/paid/12345' => Http::sequence()
+			// The test server's words for a key it does not take (2026-11-11)
+			->push(['error' => 'Greška pri autentifikaciji korisnika', 'details' => 'Neispravan, onemogućen ili istekao API ključ.'], 400)
+			->push(['error' => 'Zahtjev nije zaprimljen', 'details' => 'Nema dovoljno sredstava na računu'], 400)
+			->push(['error' => 'Zahtjev nije zaprimljen', 'details' => 'Korisnički račun je deaktiviran'], 400)
+			// The test server's words for an identifier not the account's (2026-11-11): the report's
+			->push(['error' => 'Dokument nije pronađen'], 400),
+	]);
+	$client = app(EPoslovanjeClient::class);
+	$messages = ['HTTP 400: Greška pri autentifikaciji korisnika (Neispravan, onemogućen ili istekao API ključ.)', 'HTTP 400: Zahtjev nije zaprimljen (Nema dovoljno sredstava na računu)', 'HTTP 400: Zahtjev nije zaprimljen (Korisnički račun je deaktiviran)'];
+
+	foreach ($messages as $message) {
+		$exception = rescue(fn () => $client->reportPayment('12345', '2026-10-22', 167.0), fn (Throwable $exception) => $exception, false);
+
+		expect($exception)->toBeInstanceOf(RuntimeException::class)
+			->not->toBeInstanceOf(PaymentReportRefusedException::class)
+			->and($exception->getMessage())->toBe($message);
+	}
+
+	expect(fn () => $client->reportPayment('12345', '2026-10-22', 167.0))->toThrow(PaymentReportRefusedException::class, 'HTTP 400: Dokument nije pronađen');
+});
+
 it('tells a service that is down from a key it refuses when the connection is tested, and an account that fiscalizes nothing', function () {
 	Http::fake([
 		'https://test.eposlovanje.hr/api/v2/ping' => Http::sequence()
@@ -593,6 +617,37 @@ it('gives the reason ePoslovanje notes beside a failed delivery, while it tries 
 		->and($client->status('5'))->toMatchArray(['status' => DocumentStatus::UNDELIVERED, 'error' => null]);
 });
 
+it('takes the latest payment report and failed delivery by the moment each was made, not by the text of its date, and one without an offset in Croatian time', function () {
+	$this->travelTo(Carbon::parse('2026-10-26 10:00:00', 'UTC'));
+	$refused = ['success' => false, 'errorCode' => 'S006', 'errorDescription' => 'Pristupna točka nije ovlaštena za dostavu podataka'];
+	$fiscalized = ['type' => 1, 'createdOn' => '2026-10-24T12:00:00+02:00', 'success' => true, 'completedOn' => '2026-10-24T12:00:05+02:00'];
+	Http::fake([
+		// Refused at 02:40 summer time, then made again and taken 25 minutes later, at 02:05 winter time
+		'https://test.eposlovanje.hr/api/v2/document/status/1' => Http::response(['id' => 1, 'status' => 4, 'eReportingRequests' => [
+			$fiscalized,
+			['type' => 4, 'createdOn' => '2026-10-25T02:40:00+02:00', ...$refused, 'completedOn' => '2026-10-25T02:40:01+02:00'],
+			['type' => 4, 'createdOn' => '2026-10-25T02:05:00+01:00', 'success' => true, 'completedOn' => '2026-10-25T02:05:01+01:00'],
+		]]),
+		// Refused at 23:00 Croatian time that evening, written as ePoslovanje writes it (22:00 UTC), then taken at 22:30 UTC
+		'https://test.eposlovanje.hr/api/v2/document/status/2' => Http::response(['id' => 2, 'status' => 4, 'eReportingRequests' => [
+			$fiscalized,
+			['type' => 4, 'createdOn' => '2026-10-25T22:30:00Z', 'success' => true, 'completedOn' => '2026-10-25T22:30:01Z'],
+			['type' => 4, 'createdOn' => '2026-10-25T23:00:00', ...$refused, 'completedOn' => '2026-10-25T23:00:01'],
+		]]),
+		// Taken at 02:30 summer time, its delivery failed at 02:40 and again 25 minutes later, at 02:05 winter time
+		'https://test.eposlovanje.hr/api/v2/document/status/3' => Http::response(['id' => 3, 'status' => 9, 'insertedOn' => '2026-10-25T02:30:00+02:00', 'statusHistory' => [
+			['createdOn' => '2026-10-25T02:40:00+02:00', 'status' => 9, 'statusText' => 'Neuspješna isporuka', 'note' => 'Primatelj nije dostupan'],
+			['createdOn' => '2026-10-25T02:05:00+01:00', 'status' => 9, 'statusText' => 'Neuspješna isporuka', 'note' => 'Primatelj nema poslovnu jedinicu 1200'],
+		], 'eReportingRequests' => []]),
+	]);
+	$client = app(EPoslovanjeClient::class);
+
+	expect(config('app.timezone'))->toBe('UTC')
+		->and($client->status('1'))->toMatchArray(['payment' => FiscalizationStatus::FISCALIZED, 'paymentError' => null, 'paymentReports' => 2])
+		->and($client->status('2'))->toMatchArray(['payment' => FiscalizationStatus::FISCALIZED, 'paymentError' => null, 'paymentReports' => 2])
+		->and($client->status('3'))->toMatchArray(['status' => DocumentStatus::SENT, 'error' => 'Primatelj nema poslovnu jedinicu 1200']);
+});
+
 it('takes a document the buyer approved or paid for accepted, after which no rejection comes, and the buyer\'s rejection with its note', function () {
 	$document = fn (int $id, int $status, array $history = []) => Http::response(['id' => $id, 'status' => $status, 'statusHistory' => $history, 'eReportingRequests' => []]);
 	Http::fake([
@@ -626,4 +681,17 @@ it('lists a company\'s business units by their own codes, and none for a company
 		->and($client->businessUnits('12345678903'))->toBe([]);
 
 	Http::assertSent(fn (Request $request) => $request->url() === 'https://test.eposlovanje.hr/api/v2/businessunits/69693144506' && $request->hasHeader('Authorization'));
+});
+
+it('leaves out a business unit whose code no document could name, rather than fail the listing of the others', function () {
+	Http::fake([
+		'https://test.eposlovanje.hr/api/v2/businessunits/69693144506' => Http::response([
+			['name' => 'Podružnica Senj', 'code' => '9934:69693144506::HR99:1200'],
+			// A space in its code, and another company's unit
+			['name' => 'Podružnica Rab', 'code' => '9934:69693144506::HR99:PJ 1'],
+			['name' => 'Podružnica Pag', 'code' => '9934:12345678903::HR99:1400'],
+		]),
+	]);
+
+	expect(app(EPoslovanjeClient::class)->businessUnits('69693144506'))->toBe([['name' => 'Podružnica Senj', 'code' => '1200']]);
 });

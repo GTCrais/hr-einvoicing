@@ -354,3 +354,12 @@ it('answers a delivery tried again with its reason, holds an undelivered documen
 		->and($gateway->businessUnits('69693144506'))->toBe([['name' => 'Podružnica Senj', 'code' => '1200']])
 		->and($gateway->businessUnits('12345678903'))->toBe([]);
 });
+
+it('leaves a document it never held unknown when a test deletes it, as the real one knows nothing of it', function () {
+	$gateway = new FakeEInvoiceGateway;
+
+	$gateway->deleteDocument('9999');
+
+	expect(fn () => $gateway->status('9999'))->toThrow(RuntimeException::class, 'The intermediary does not know the document 9999.')
+		->and($gateway->statuses)->toBe([]);
+});

@@ -63,6 +63,9 @@ class MojEracunClient implements EInvoiceGateway
 	/** The buyer's process statuses after which no rejection comes: approved, paid, partly paid */
 	protected const array PROCESS_ACCEPTED = [0, 2, 3];
 
+	/** The fields of the account every call carries, as a refusal of one names it ({"SoftwareId": {"Messages": […]}}) */
+	protected const array ACCOUNT_FIELDS = ['username', 'password', 'companyId', 'companyBU', 'softwareId'];
+
 	/**
 	 * The time zone a date of Moj-eRačun's answers is read in when it is written without an offset: Croatian time, the
 	 * service's own. Its answers have carried one so far (the demo's "2026-10-22T16:48:12+02:00", the manual's "…Z"),
@@ -170,7 +173,9 @@ class MojEracunClient implements EInvoiceGateway
 			$answersError = $exception->getMessage();
 		}
 
-		[$fiscalization, $error] = $this->latestAnswer($messages, self::FISCALIZATION_MESSAGE_TYPES);
+		// A fiscalization the tax authority took stays taken whatever a later message of the document says (a duplicate
+		// request refused); a payment report's answer is the latest
+		[$fiscalization, $error] = $this->latestAnswer($messages, self::FISCALIZATION_MESSAGE_TYPES, anySuccess: true);
 		[$payment, $paymentError] = $this->latestAnswer($messages, [self::PAYMENT_MESSAGE_TYPE]);
 
 		// Every payment report it took has a message of its own, answered or not
@@ -198,8 +203,9 @@ class MojEracunClient implements EInvoiceGateway
 	 */
 	protected function buyerVerdict(string $electronicId, DocumentStatus $status, array $messages): array
 	{
+		// A blank status ("") is no answer either, as latestAnswer() reads it: (int) "" would read as 0, taken
 		$recorded = collect($messages)->first(fn (array $message) => (int) $this->value($message, 'messageType') === self::REJECTION_MESSAGE_TYPE
-			&& $this->value($message, 'status') !== null && (int) $this->value($message, 'status') === 0);
+			&& filled($this->value($message, 'status')) && (int) $this->value($message, 'status') === 0);
 		$recordedReason = $recorded !== null ? (trim((string) ($this->value($recorded, 'businessStatusReason') ?? '')) ?: null) : null;
 
 		if ($status !== DocumentStatus::DELIVERED) {
@@ -214,7 +220,9 @@ class MojEracunClient implements EInvoiceGateway
 
 		$row = collect(array_is_list($rows) ? $rows : [$rows])
 			->first(fn ($row) => is_array($row) && (string) $this->value($row, 'ElectronicId') === $electronicId);
-		$process = is_array($row) && $this->value($row, 'DocumentProcessStatusId') !== null ? (int) $this->value($row, 'DocumentProcessStatusId') : null;
+		// A blank process status ("") is none either, as a blank answer is in latestAnswer(): (int) "" would read as 0, an
+		// approval nobody gave
+		$process = is_array($row) && filled($this->value($row, 'DocumentProcessStatusId')) ? (int) $this->value($row, 'DocumentProcessStatusId') : null;
 		$rejected = $recorded !== null || $process === self::PROCESS_REJECTED;
 		$processReason = $process === self::PROCESS_REJECTED ? (trim((string) ($this->value($row, 'RejectReason') ?? '')) ?: null) : null;
 
@@ -329,7 +337,9 @@ class MojEracunClient implements EInvoiceGateway
 
 	/**
 	 * The latest of the tax authority's answers of the given types: taken, refused with its code and reason, or
-	 * waiting; nothing while there is none. The latest by the moment each was given, never by the text of its date,
+	 * waiting, as is a message it has not answered yet (one without a status); nothing while there is none. With
+	 * anySuccess, taken once any of them was taken, whatever a later one says (a duplicate request refused), as its
+	 * word on a document stands once given. The latest by the moment each was given, never by the text of its date,
 	 * whose offset changes with the clock: on the night summer time ends, an answer of 02:05+01:00 came 25 minutes
 	 * after one of 02:40+02:00. Of answers given at the same moment the one listed last is the latest, and one whose
 	 * moment cannot be read counts as no earlier than those listed before it.
@@ -338,16 +348,23 @@ class MojEracunClient implements EInvoiceGateway
 	 * @param  list<int>  $types
 	 * @return array{0: ?FiscalizationStatus, 1: ?string}
 	 */
-	protected function latestAnswer(array $messages, array $types): array
+	protected function latestAnswer(array $messages, array $types, bool $anySuccess = false): array
 	{
 		$latest = null;
 		$latestAt = PHP_INT_MIN;
+		$taken = false;
 
 		foreach ($messages as $message) {
-			if (!in_array((int) $this->value($message, 'messageType'), $types, true)) {
+			// A message whose type is blank or missing is of no type asked for: (int) "" would read as 0, an answer about the
+			// document itself
+			$type = $this->value($message, 'messageType');
+
+			if (!filled($type) || !in_array((int) $type, $types, true)) {
 				continue;
 			}
 
+			$status = $this->value($message, 'status');
+			$taken = $taken || (filled($status) && (int) $status === 0);
 			$at = $this->instant($this->value($message, 'dateOfFiscalization'));
 
 			if ($at === null || $at >= $latestAt) {
@@ -356,11 +373,22 @@ class MojEracunClient implements EInvoiceGateway
 			}
 		}
 
-		if ($latest === null || $this->value($latest, 'status') === null) {
+		if ($latest === null) {
 			return [null, null];
 		}
 
-		return match ((int) $this->value($latest, 'status')) {
+		if ($anySuccess && $taken) {
+			return [FiscalizationStatus::FISCALIZED, null];
+		}
+
+		$status = $this->value($latest, 'status');
+
+		// A message the tax authority has not answered yet carries no status
+		if (blank($status)) {
+			return [FiscalizationStatus::WAITING, null];
+		}
+
+		return match ((int) $status) {
 			0 => [FiscalizationStatus::FISCALIZED, null],
 			1 => [FiscalizationStatus::FAILED, $this->messageError($latest)],
 			default => [FiscalizationStatus::WAITING, null],
@@ -441,7 +469,8 @@ class MojEracunClient implements EInvoiceGateway
 	 * What the intermediary answered; its refusal becomes an exception with its message. A 404 of Moj-eRačun's own is no
 	 * error for the calls that answer it while they have nothing to tell, and comes back empty; any other 404 (a proxy's
 	 * page, a route moved) is thrown, as it says nothing of what Moj-eRačun holds. A payment report it refuses on the
-	 * spot (the tax authority's refusal passed on at once) is a PaymentReportRefusedException, for the app to word.
+	 * spot (the tax authority's refusal passed on at once, a report it cannot take) is a PaymentReportRefusedException,
+	 * for the app to word; a refusal of the account is not (refusesAccount()), as it passes once the account is put right.
 	 *
 	 * @param  array<string, mixed>  $account
 	 * @return array<int|string, mixed>
@@ -458,7 +487,7 @@ class MojEracunClient implements EInvoiceGateway
 			throw new EInvoiceRefusedException($this->failure($response, $account));
 		}
 
-		if ($paymentReport && in_array($response->status(), [400, 422], true)) {
+		if ($paymentReport && in_array($response->status(), [400, 422], true) && !$this->refusesAccount($response)) {
 			throw new PaymentReportRefusedException($this->failure($response, $account));
 		}
 
@@ -568,6 +597,35 @@ class MojEracunClient implements EInvoiceGateway
 		}
 
 		return (bool) preg_match('/\b(HR-)?BR-[A-Z0-9-]+/', $response->body());
+	}
+
+	/**
+	 * Whether a refusal is of the account rather than of what was sent: it refuses a field of the account (a wrong
+	 * password or software identifier, {"SoftwareId": {"Messages": […]}}) and names no code of the tax authority.
+	 */
+	protected function refusesAccount(Response $response): bool
+	{
+		$json = $response->json();
+
+		if (!is_array($json)) {
+			return false;
+		}
+
+		$specifics = $this->value($json, 'taxAdministrationSpecifics');
+
+		if (is_array($specifics) && filled($this->value($specifics, 'code'))) {
+			return false;
+		}
+
+		foreach (self::ACCOUNT_FIELDS as $field) {
+			$answer = $this->value($json, $field);
+
+			if (is_array($answer) && ($this->value($answer, 'Messages') !== null || $this->value($answer, 'Value') !== null)) {
+				return true;
+			}
+		}
+
+		return false;
 	}
 
 	/**

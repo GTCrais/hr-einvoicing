@@ -88,7 +88,7 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain, ListsBusine
 	 * The time zone of ePoslovanje's nightly delivery tries (around midnight, Croatian time; ePoslovanje, 2026-11-03), in
 	 * which the end of the last day of trying is worked out, and the one it writes a moment in when it gives it without an
 	 * offset (insertedOn: "2026-11-11T17:05:24.338685" for a document taken at 17:05 Croatian time, its test server on
-	 * 2026-10-24 and 2026-11-11)
+	 * 2026-10-24 and 2026-11-11; the createdOn of its history and of its eReporting requests alike)
 	 */
 	protected const string TIMEZONE = 'Europe/Zagreb';
 
@@ -228,7 +228,9 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain, ListsBusine
 	/**
 	 * The business units FINA's B2G service lists for the OIB, a public-sector recipient's (ePoslovanje, 2026-11-03: the
 	 * call "covers all FINA B2G business units"), each taken down to its own code; a company that is no such recipient,
-	 * or has no unit there, gets an empty list, which says nothing of units it may have at its own intermediary.
+	 * or has no unit there, gets an empty list, which says nothing of units it may have at its own intermediary. A unit
+	 * whose code no document can name (a space or a colon in it, or another company's, as HrUbl::businessUnitCode()
+	 * refuses it) is left out, rather than fail the listing of the others.
 	 *
 	 * @return list<array{name: string, code: string}>
 	 */
@@ -238,7 +240,15 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain, ListsBusine
 
 		return collect(array_is_list($units) ? $units : [$units])
 			->filter(fn ($unit) => is_array($unit) && filled($unit['code'] ?? null))
-			->map(fn (array $unit) => ['name' => trim((string) ($unit['name'] ?? '')), 'code' => HrUbl::businessUnitCode((string) $unit['code'], $oib)])
+			->map(function (array $unit) use ($oib) {
+				try {
+					$code = HrUbl::businessUnitCode((string) $unit['code'], $oib);
+				} catch (InvalidArgumentException) {
+					$code = '';
+				}
+
+				return ['name' => trim((string) ($unit['name'] ?? '')), 'code' => $code];
+			})
 			->filter(fn (array $unit) => $unit['code'] !== '')
 			->values()
 			->all();
@@ -349,7 +359,8 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain, ListsBusine
 	 * The tax authority's answer to the document's requests of one kind: taken when ePoslovanje marks the request a
 	 * success (for the fiscalization, any of them: a later duplicate refused changes nothing), refused with the tax
 	 * authority's code and reason when the latest is marked a failure or stamped completed without success, else
-	 * still waiting; nothing while ePoslovanje has made no such request.
+	 * still waiting; nothing while ePoslovanje has made no such request. The latest by the moment each was made
+	 * (instant()), one that names none counting as the earliest, and of the same moment the one listed last.
 	 *
 	 * @param  array<string, mixed>  $document
 	 * @return array{0: ?FiscalizationStatus, 1: ?string}
@@ -358,7 +369,7 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain, ListsBusine
 	{
 		$requests = collect((array) ($document['eReportingRequests'] ?? []))
 			->filter(fn ($request) => is_array($request) && (int) ($request['type'] ?? 0) === $type)
-			->sortBy(fn (array $request) => (string) ($request['createdOn'] ?? ''))
+			->sortBy(fn (array $request) => $this->instant($request['createdOn'] ?? null) ?? -INF)
 			->values();
 
 		$latest = $requests->last();
@@ -409,7 +420,8 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain, ListsBusine
 	}
 
 	/**
-	 * The document's latest entry of the given standing in its history (by createdOn), null when it has none.
+	 * The document's latest entry of the given standing in its history, by the moment of its createdOn (instant()), one
+	 * that names none counting as the earliest, and of the same moment the one listed last; null when it has none.
 	 *
 	 * @param  array<string, mixed>  $document
 	 * @return array<string, mixed>|null
@@ -418,8 +430,29 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain, ListsBusine
 	{
 		return collect((array) ($document['statusHistory'] ?? []))
 			->filter(fn ($row) => is_array($row) && (int) ($row['status'] ?? 0) === $code)
-			->sortBy(fn (array $row) => (string) ($row['createdOn'] ?? ''))
+			->sortBy(fn (array $row) => $this->instant($row['createdOn'] ?? null) ?? -INF)
 			->last();
+	}
+
+	/**
+	 * The moment a date of an answer names, to the microsecond, for ordering the entries of one answer: by its offset
+	 * when it carries one, else in Croatian time (TIMEZONE), as ePoslovanje writes createdOn, so dates written with
+	 * different offsets, or with and without one, order right whatever time zone the app runs in, where their text
+	 * would not (on the night summer time ends, 02:05+01:00 comes 25 minutes after 02:40+02:00); null when it names
+	 * none that can be read. Two dates written without an offset in the hour that night repeats name no moment apart,
+	 * and keep the order of their text.
+	 */
+	protected function instant(mixed $date): ?float
+	{
+		if (!is_string($date) || trim($date) === '') {
+			return null;
+		}
+
+		try {
+			return CarbonImmutable::parse($date, self::TIMEZONE)->getPreciseTimestamp();
+		} catch (InvalidArgumentException) {
+			return null;
+		}
 	}
 
 	/**
@@ -450,8 +483,9 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain, ListsBusine
 		}
 
 		// A payment report refused on the spot (the tax authority's refusal passed on, a report it could not take) is
-		// said as such, for the app to word; a failure of the line or of the service is an ordinary one
-		if ($paymentReport && in_array($response->status(), [400, 422], true)) {
+		// said as such, for the app to word; a refusal of the account (its key, its funds, an account not active, weighed
+		// as a send's is) and a failure of the line or of the service are ordinary ones
+		if ($paymentReport && $this->refusesDocument($response)) {
 			throw new PaymentReportRefusedException($this->failure($response, $account));
 		}
 
@@ -489,7 +523,8 @@ class EPoslovanjeClient implements EInvoiceGateway, FiscalizesAgain, ListsBusine
 	}
 
 	/**
-	 * Whether the answer refuses the document itself: a 422, or a 400 that is not the account's own refusal.
+	 * Whether the answer refuses what was sent itself, the document or a payment report: a 422, or a 400 that is not the
+	 * account's own refusal.
 	 * ePoslovanje names three causes for a send's 400: the document failing its checks (the buyer missing from the tax
 	 * authority's registry among them), the account not active, and its funds spent; a key it does not know it
 	 * answers the same way ("Greška pri autentifikaciji korisnika"). The validation's own words or a rule of the

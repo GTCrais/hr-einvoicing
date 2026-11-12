@@ -94,7 +94,7 @@ try {
 | `send(string $xml): array` | Sends the document; returns `electronicId` and its `DocumentStatus`. A document whose number the intermediary holds already for the year (ePoslovanje's "already exists", Moj-eRačun's "already exists with EID=…") is refused with an `EInvoiceRefusedException`, as a document breaking the rules is; an app that sent it minutes after a try whose answer was lost looks it up instead |
 | `sentDocument(string $number, DateTimeInterface $since, ?string $issueDate = null): ?array` | Finds a document sent since then by its number, for a send whose answer was lost; numbers start again every year, so pass the day of issue (`cbc:IssueDate`, Y-m-d) to tell one year's document from the next. Moj-eRačun is asked for that number of that year alone (its `InvoiceNumber` and `InvoiceYear` filters), so the answer is never a page of the outbox the document may be missing from |
 | `status(string $electronicId): array` | The document's `DocumentStatus`; the tax authority's answer about it, `fiscalization` (a `FiscalizationStatus`, or null while the intermediary has said nothing) with its reason in `fiscalizationError`; and its answer to the latest payment report, `payment` with `paymentError`; and `paymentReports`, how many payment reports the intermediary holds of the document (every one it took, those the tax authority refused included), which tells an app that reports more than one payment of a document (one taken back with a negative report, then reported again) whether a report whose answer was lost reached it. `error` is the reason to keep for the standing: for a `REJECTED` document why the buyer rejected it, when it said (`rejectionReason`), for an `UNDELIVERED` one the reason the intermediary gives for the failed delivery, when it gives one (ePoslovanje: the note beside the status in the document's history, promised 2026-11-02), and the same while it still retries the delivery (`deliveryRetriesUntil`), for a `REFUSED` one the intermediary's reason, else the tax authority's (`fiscalizationError`). `deliveryRetriesUntil` (an ISO 8601 moment, or null) is set while the intermediary still retries a delivery that failed, the document staying `SENT`; `accepted` is true once the buyer approved or paid the document, after which no rejection comes. The reasons are null where the intermediary gave none. When the standing is known but the tax authority's answers cannot be read (Moj-eRačun reads them with a second call), `answersError` says why and `fiscalization`, `payment`, their reasons and `paymentReports` are unknown rather than none; take a null `payment` for a report never made only when `answersError` is null |
-| `reportPayment(string $electronicId, string $paidOn, float $amount): void` | Reports a payment by bank transfer to the tax authority. Moj-eRačun answers with the tax authority's word at once, ePoslovanje queues the report and the answer comes later in `status()`'s `payment`. A report either refuses on the spot (HTTP 400 or 422: the tax authority's refusal passed on, a report it cannot take) is thrown as a `PaymentReportRefusedException`, for the app to word as a refusal; a failure of the line or of the service stays a plain `RuntimeException` |
+| `reportPayment(string $electronicId, string $paidOn, float $amount): void` | Reports a payment by bank transfer to the tax authority. Moj-eRačun answers with the tax authority's word at once, ePoslovanje queues the report and the answer comes later in `status()`'s `payment`. A report either refuses on the spot (HTTP 400 or 422: the tax authority's refusal passed on, a report it cannot take) is thrown as a `PaymentReportRefusedException`, for the app to word as a refusal; a refusal of the account (Moj-eRačun refusing a field of the account, such as the password or the software identifier; ePoslovanje refusing the key, the funds or an account not active, weighed as for a send) and a failure of the line or of the service stay a plain `RuntimeException` |
 | `ping(): void` | Tests the connection with the account, and on ePoslovanje that the account fiscalizes its outgoing documents itself; throws `EInvoiceUnavailableException` when the service itself is down (no answer, an answer cut off on its way, or a server error), to the ping or to the call that checks the account after it, so the account could not be tried; a refusal of the account is a `RuntimeException` |
 
 A gateway that also implements `Contracts\FiscalizesAgain` (ePoslovanje, and the fake as ePoslovanje or under its own name) takes `fiscalizeAgain($electronicId)`:
@@ -108,7 +108,8 @@ intermediary's affair (FINA refuses a wrong one, some take every invoice; ePoslo
 with none may still receive by unit. ePoslovanje's listing is FINA's B2G register, the units of public-sector
 recipients (ePoslovanje, 2026-11-03), so a private company's units at its own intermediary are never in it. Each comes
 with its `name` and its `code`, the unit's own code (ePoslovanje lists `9934:OIB::HR99:1200`, the package gives
-`1200`), for a buyer's `businessUnit` (see Writing documents).
+`1200`), for a buyer's `businessUnit` (see Writing documents); a unit whose code no document can name (one
+`HrUbl::businessUnitCode()` refuses: a space or a colon in it, or another company's) is left out of the list.
 
 `DocumentStatus` is `SENT` (with the intermediary, on its way), `DELIVERED` (the buyer has it, approved or paid too),
 `REPORTED` (reported to the tax authority instead, because the buyer takes no e-invoices; Moj-eRačun does this),
@@ -126,19 +127,23 @@ Moj-eRačun's duplicate check allows for a document in 50 alone.
 A Moj-eRačun document is `REJECTED` once the tax authority recorded the buyer's rejection (a fiscalization message of
 type 2 it took) or, for a delivered one, once the buyer set its process status to rejected
 (`queryDocumentProcessStatusOutbox`, `DocumentProcessStatusId` 1, with its `RejectReason`); the process status also
-tells `accepted` (0 approved, 2 paid, 3 partly paid), and one that cannot be read leaves the verdict to the next read.
+tells `accepted` (0 approved, 2 paid, 3 partly paid), and one that cannot be read, or is left blank, leaves the verdict
+to the next read; a message whose type is blank or missing is no answer about the document.
 ePoslovanje's codes 5, 7 and 8 are `accepted`, 6 is `REJECTED`, and 9 (delivery failed) is `SENT` with
 `deliveryRetriesUntil` while ePoslovanje retries, until the end of the `EPoslovanjeClient::DELIVERY_RETRY_DAYS`-th (7)
 day after it took the document, in Croatian time, an estimate of its seven nightly tries (ePoslovanje, 2026-11-03), and
-`UNDELIVERED` after that. ePoslovanje writes the moment it took a document (`insertedOn`) without an offset, in Croatian
-time, and the package reads it so whatever time zone the app runs in, as it reads any date of Moj-eRačun's answers that
-comes without an offset (those it has given so far carry one); a date with an offset is read by its offset. The law
+`UNDELIVERED` after that. ePoslovanje writes the moment it took a document (`insertedOn`), and those of its history and
+its eReporting requests (`createdOn`), without an offset, in Croatian time, and the package reads them so whatever time
+zone the app runs in, as it reads any date of Moj-eRačun's answers that comes without an offset (those it has given so
+far carry one); a date with an offset is read by its offset, and the latest of an answer's entries is the latest by
+the moment its date names, never by the text of the date. The law
 sets no time for a buyer's rejection, which mostly comes after the tax authority took the document, so follow a
 delivered one until it is `accepted` or as long as you choose.
 `FiscalizationStatus` is `FISCALIZED`, `FAILED` (with the tax authority's code and reason in `fiscalizationError`, and in
-`error` unless the document is `REJECTED`) or `WAITING`. On
-ePoslovanje a fiscalization counts as taken only when it is marked a success (it marks a refused one completed too), and
-once taken it stays taken whatever a later duplicate request says.
+`error` unless the document is `REJECTED`) or `WAITING` (the tax authority has not answered yet). On
+ePoslovanje a fiscalization counts as taken only when it is marked a success (it marks a refused one completed too). On
+either intermediary a fiscalization once taken stays taken whatever a later request of the same document says (a
+duplicate refused), while a payment report's answer is the latest one.
 
 Every call throws a `RuntimeException` with the reason when it fails, an answer cut off on its way included. The reason
 never carries the account's password or API key, whatever the intermediary echoed back: a Moj-eRačun answer about the
@@ -379,8 +384,8 @@ with the intermediary and the service it stood in for (`calls`), so a test can s
 `paymentReports` counts the reports made through it, those refused at once (`refusePaymentNext()`) included, unless
 `setStatus()` names a number. `businessUnits` holds the units `businessUnits()` lists for an OIB (none by default),
 `deleteDocument($electronicId)` stands for a document deleted in the intermediary's web application (no lookup finds
-it again, so its number can go again), and `setStatus()` takes `deliveryRetriesUntil` and `accepted` as `status()`
-answers them.
+it again, so its number can go again; one it never held stays unknown), and `setStatus()` takes `deliveryRetriesUntil`
+and `accepted` as `status()` answers them.
 
 `UblSchema::errors($xml)` checks a document against the UBL 2.1 Invoice or CreditNote schema with the Croatian
 extension and returns what is wrong, or an empty array.
